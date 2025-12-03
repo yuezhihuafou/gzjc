@@ -1,0 +1,9 @@
+# CWRU 数据集加载脚本依赖
+numpy>=1.20.0
+scipy>=1.7.0
+
+# 可选: 深度学习框架 (取消注释以使用 PyTorch Dataset)
+# torch>=1.10.0
+
+# 可选: 数据可视化
+# matplotlib>=3.4.0
