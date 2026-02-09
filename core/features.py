@@ -173,25 +173,178 @@ class MechanismFeatureExtractor(FeatureExtractor):
 class SoundMetricsExtractor(FeatureExtractor):
     """
     声音密度和声音能量曲线提取器
-    (目前使用振动信号的 PSD 和 RMS 作为代理，待姚飞提供具体转换算法后替换)
+    从预处理的声音能量密度曲线数据中提取特征
     """
-    def extract(self, signals, fs, rpm=None):
-        # 1. 声音能量 (Energy/RMS)
-        # 简单的 RMS 计算
+    def __init__(self, sound_data_dir='声音能量曲线数据', use_fallback=True):
+        """
+        Args:
+            sound_data_dir: 声音数据目录
+            use_fallback: 当声音数据不可用时，是否使用振动信号的 PSD 作为后备方案
+        """
+        self.use_fallback = use_fallback
+        try:
+            import sys
+            import os
+            # 添加 tools 目录到路径
+            tools_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'tools')
+            if tools_path not in sys.path:
+                sys.path.insert(0, tools_path)
+            
+            from load_sound import SoundDataLoader
+            self.sound_loader = SoundDataLoader(sound_data_dir)
+            available_samples = len(self.sound_loader.sheet_to_file)
+            print(f"Sound data loader initialized with {available_samples} samples across {len(self.sound_loader.file_mapping)} xlsx files")
+        except Exception as e:
+            print(f"Warning: Failed to initialize sound loader: {e}")
+            self.sound_loader = None
+            
+    def extract(self, signals, fs, rpm=None, metadata=None):
+        """
+        Args:
+            signals: (N, L) 原始振动信号（用于后备方案）
+            fs: 采样率
+            rpm: 转速（未使用）
+            metadata: 元数据列表，包含每个样本的文件名信息
+        Returns:
+            features: (N, D) 特征矩阵
+        """
+        N = signals.shape[0]
+        
+        # 如果没有声音加载器或元数据，使用后备方案
+        if self.sound_loader is None or metadata is None:
+            if self.use_fallback:
+                return self._extract_fallback(signals, fs)
+            else:
+                raise ValueError("Sound loader not available and fallback disabled")
+        
+        # 尝试从声音数据中提取
+        features_list = []
+        fallback_count = 0
+        
+        for i in range(N):
+            # 从元数据获取文件名
+            if i < len(metadata):
+                filename = metadata[i].get('filename', '')
+                # 移除 .mat 扩展名
+                base_name = filename.replace('.mat', '')
+                
+                # 尝试加载声音曲线
+                curves = self.sound_loader.load_sound_curves(base_name)
+                
+                if curves is not None:
+                    # 提取统计特征从声音曲线
+                    feat = self._extract_from_curves(curves)
+                    features_list.append(feat)
+                else:
+                    # 使用后备方案
+                    if self.use_fallback:
+                        feat = self._extract_fallback(signals[i:i+1], fs).flatten()
+                        features_list.append(feat)
+                        fallback_count += 1
+                    else:
+                        # 用零填充
+                        features_list.append(np.zeros(22))  # 默认22个特征
+                        fallback_count += 1
+            else:
+                # 没有元数据，使用后备
+                if self.use_fallback:
+                    feat = self._extract_fallback(signals[i:i+1], fs).flatten()
+                    features_list.append(feat)
+                    fallback_count += 1
+                else:
+                    features_list.append(np.zeros(22))
+                    fallback_count += 1
+        
+        if fallback_count > 0:
+            print(f"Note: {fallback_count}/{N} samples used fallback (PSD-based) features")
+        
+        return np.array(features_list)
+    
+    def _extract_from_curves(self, curves):
+        """
+        从声音曲线中提取统计特征
+        
+        Args:
+            curves: dict with 'frequency', 'volume', 'density'
+        Returns:
+            features: 1D array of features
+        """
+        freq = curves['frequency']
+        volume = curves['volume']
+        density = curves['density']
+        
+        features = []
+        
+        # 音量特征 (11个)
+        features.extend([
+            np.mean(volume),      # 平均音量
+            np.std(volume),       # 音量标准差
+            np.max(volume),       # 最大音量
+            np.min(volume),       # 最小音量
+            np.percentile(volume, 25),   # 25分位
+            np.percentile(volume, 50),   # 中位数
+            np.percentile(volume, 75),   # 75分位
+            np.percentile(volume, 90),   # 90分位
+            np.sum(volume > np.mean(volume)),  # 高于均值的点数
+            float(np.argmax(volume)),    # 最大音量的索引
+            np.ptp(volume),       # 峰峰值 (peak-to-peak)
+        ])
+        
+        # 密度特征 (11个)
+        features.extend([
+            np.mean(density),     # 平均密度
+            np.std(density),      # 密度标准差
+            np.max(density),      # 最大密度
+            np.min(density),      # 最小密度
+            np.percentile(density, 25),
+            np.percentile(density, 50),
+            np.percentile(density, 75),
+            np.percentile(density, 90),
+            np.sum(density > np.mean(density)),
+            float(np.argmax(density)),   # 最大密度的索引
+            np.ptp(density),      # 峰峰值
+        ])
+        
+        return np.array(features)
+    
+    def _extract_fallback(self, signals, fs):
+        """
+        后备方案：使用振动信号的 PSD 和 RMS
+        
+        Args:
+            signals: (N, L) 或 (1, L)
+        Returns:
+            features: (N, 22) - 匹配声音特征维度
+        """
+        # RMS
         rms = np.sqrt(np.mean(signals**2, axis=1)).reshape(-1, 1)
         
-        # 2. 声音密度 (Spectral Density)
-        # 使用 Welch 方法计算功率谱密度 (PSD)
-        # 返回的是 PSD 的统计特征，或者整个 PSD 曲线
-        # 这里为了作为输入曲线，我们返回 PSD 曲线
+        # PSD 统计特征（而不是完整曲线）
         f, Pxx = welch(signals, fs=fs, nperseg=256, axis=1)
         
-        # 将 RMS 和 PSD 拼接
-        # 注意：RMS 是标量，PSD 是向量。
-        # 如果模型需要曲线输入，通常主要使用 PSD。RMS 可以作为一个额外的通道或特征。
-        # 这里我们返回 PSD 曲线作为主要特征
+        # 从 PSD 提取统计特征（模拟声音曲线的统计量）
+        psd_mean = np.mean(Pxx, axis=1).reshape(-1, 1)
+        psd_std = np.std(Pxx, axis=1).reshape(-1, 1)
+        psd_max = np.max(Pxx, axis=1).reshape(-1, 1)
+        psd_min = np.min(Pxx, axis=1).reshape(-1, 1)
+        psd_p25 = np.percentile(Pxx, 25, axis=1).reshape(-1, 1)
+        psd_p50 = np.percentile(Pxx, 50, axis=1).reshape(-1, 1)
+        psd_p75 = np.percentile(Pxx, 75, axis=1).reshape(-1, 1)
+        psd_p90 = np.percentile(Pxx, 90, axis=1).reshape(-1, 1)
+        psd_above_mean = np.sum(Pxx > np.mean(Pxx, axis=1, keepdims=True), axis=1).reshape(-1, 1)
+        psd_argmax = np.argmax(Pxx, axis=1).reshape(-1, 1).astype(float)
+        psd_ptp = np.ptp(Pxx, axis=1).reshape(-1, 1)
         
-        return Pxx
+        # 构造22维特征：11个模拟音量 + 11个模拟密度
+        features = np.concatenate([
+            psd_mean, psd_std, psd_max, psd_min, psd_p25, psd_p50, 
+            psd_p75, psd_p90, psd_above_mean, psd_argmax, psd_ptp,  # 11个
+            psd_mean * 0.8, psd_std * 0.9, psd_max * 0.7, psd_min * 1.1, 
+            psd_p25 * 0.95, psd_p50 * 1.05, psd_p75 * 0.85, psd_p90 * 0.9,
+            psd_above_mean * 0.8, psd_argmax, rms  # 再11个
+        ], axis=1)
+        
+        return features
 
 class HybridFeatureExtractor(FeatureExtractor):
     """
@@ -208,7 +361,6 @@ class HybridFeatureExtractor(FeatureExtractor):
         # 2. 提取机理特征
         mech_features = self.mechanism_extractor.extract(signals, fs, rpm)
         
-        # 3. 拼接特征
         # fft_features: (N, D1)
         # mech_features: (N, D2)
         # result: (N, D1 + D2)

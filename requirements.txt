@@ -1,9 +1,57 @@
-# CWRU 数据集加载脚本依赖
-numpy>=1.20.0
+# ============================================================================
+# 机械故障诊断系统 - 依赖包列表
+# ============================================================================
+# 安装方法: pip install -r requirements.txt
+# 或使用虚拟环境: python -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+# ============================================================================
+
+# ===== 核心依赖 =====
+# 数值计算
+numpy>=1.20.0,<2.0.0
 scipy>=1.7.0
 
-# 可选: 深度学习框架 (取消注释以使用 PyTorch Dataset)
-# torch>=1.10.0
+# 数据处理
+pandas>=1.3.0
 
-# 可选: 数据可视化
-# matplotlib>=3.4.0
+# ===== 深度学习框架 =====
+# PyTorch (根据 CUDA 版本选择，或使用 CPU 版本)
+# CPU 版本:
+# torch>=1.12.0
+# torchvision>=0.13.0
+# torchaudio>=0.12.0
+
+# CUDA 11.8 版本 (在 Ubuntu 上安装):
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# CUDA 12.1 版本:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# ===== 机器学习 =====
+scikit-learn>=1.0.0
+
+# ===== 数据可视化 =====
+matplotlib>=3.4.0
+seaborn>=0.11.0
+
+# ===== 进度条 =====
+tqdm>=4.62.0
+
+# ===== Excel 文件处理 =====
+openpyxl>=3.0.0
+
+# ===== HTTP 请求 =====
+requests>=2.25.0
+
+# ===== 模型保存/加载 =====
+joblib>=1.0.0
+
+# ===== 可选依赖 =====
+# 如果需要使用 TensorFlow (legacy 代码):
+# tensorflow>=2.8.0
+
+# 如果需要使用 scipy.signal:
+# (已包含在 scipy 中)
+
+# ===== 开发依赖 (可选) =====
+# jupyter>=1.0.0
+# ipython>=7.0.0

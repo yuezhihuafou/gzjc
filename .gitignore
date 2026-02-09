@@ -47,6 +47,7 @@ cwru_processed/
 .cache/
 *.npy
 *.pkl
+datasets/
 
 # Conda
 .conda/
