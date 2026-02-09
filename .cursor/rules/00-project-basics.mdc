@@ -1,0 +1,11 @@
+---
+alwaysApply: true
+---
+
+- Keep changes minimal and focused.
+- Prefer modifying existing code over refactor.
+- Follow existing naming and patterns.
+- Add brief inline comments only where logic changes.
+- Prefer diff/patch output.
+- Do not explain unless I say "explain".
+- Do not scan the whole repo unless asked.

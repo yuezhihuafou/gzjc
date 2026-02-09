@@ -1,0 +1,6 @@
+# Windows 下用 Intel/AMD 核显加速（DirectML），在 nlp 环境中安装
+# 使用: conda activate nlp && pip install -r requirements-nlp-dml.txt
+# 然后: python experiments/train.py ... --eval_only --device dml
+
+# 支持 PyTorch 2.3.1 及以下；安装后可用 Intel Iris Xe 等核显加速
+torch-directml

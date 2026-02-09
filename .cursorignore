@@ -1,0 +1,87 @@
+# 数据目录 - 避免IDE自动索引大型数据文件
+data/
+datasets/
+datasets/**
+cwru_processed/
+cwru_processed/**
+声音能量曲线数据/
+声音能量曲线数据/**
+output/
+output_*/
+temp/
+tmp/
+cache/
+.cache/
+
+# 日志和检查点
+logs/
+log/
+checkpoints/
+*.log
+
+# 大型数据文件 - 避免自动读取
+*.wav
+*.f
+*.mat
+*.npy
+*.npz
+*.pt
+*.pth
+*.pkl
+*.pickle
+*.zip
+*.tar
+*.tar.gz
+*.gz
+*.h5
+*.hdf5
+*.xlsx
+*.xls
+*.csv
+*.parquet
+*.feather
+
+# 模型和权重文件
+*.ckpt
+*.safetensors
+*.onnx
+*.pb
+
+# 图像和视频（如果很大）
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.mp4
+*.avi
+*.mov
+
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+venv/
+env/
+.venv/
+ENV/
+conda_env/
+
+# IDE配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini

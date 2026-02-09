@@ -1,0 +1,9 @@
+# 在 conda 环境 nlp 中安装，用于 Intel 核显 (XPU) 测试集验证
+# 使用: conda activate nlp && pip install -r requirements-nlp-xpu.txt
+#
+# 若报错 "No matching distribution found"：
+#   - 多因当前 Python 在 Windows 下无对应 wheel（如 Python 3.13）。
+#   - 建议用 Python 3.10 或 3.11 新建环境再装，或直接使用 CPU 验证（见下方说明）。
+
+# Intel 核显/独显扩展（提供 torch.xpu）。若安装失败可改用 CPU：不加 --device xpu 即可
+intel-extension-for-pytorch

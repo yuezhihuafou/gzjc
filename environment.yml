@@ -1,0 +1,28 @@
+name: guzhangjiance
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - numpy>=1.20.0,<2.0.0
+  - scipy>=1.7.0
+  - pandas>=1.3.0
+  - scikit-learn>=1.0.0
+  - matplotlib>=3.4.0
+  - seaborn>=0.11.0
+  - tqdm>=4.62.0
+  - openpyxl>=3.0.0
+  - joblib>=1.0.0
+  - requests>=2.25.0
+  - pip:
+    # PyTorch - 根据系统选择安装
+    # CPU版本（Windows默认）:
+    - torch>=1.12.0
+    - torchvision>=0.13.0
+    - torchaudio>=0.12.0
+    # 如果需要CUDA版本，请取消注释并注释掉CPU版本:
+    # - torch>=1.12.0 --index-url https://download.pytorch.org/whl/cu118
+    # - torchvision>=0.13.0 --index-url https://download.pytorch.org/whl/cu118
+    # - torchaudio>=0.12.0 --index-url https://download.pytorch.org/whl/cu118

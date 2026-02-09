@@ -1,0 +1,10 @@
+# 在已激活的 ipex 环境中补充安装（若 environment_ipex.yml 中 IPEX 安装失败时使用）
+# conda activate ipex
+# pip install -r requirements-ipex.txt
+
+# 若上面仍报 No matching distribution found，可尝试 Intel 官方源（二选一）：
+# pip install intel-extension-for-pytorch --extra-index-url https://pytorch-extension.intel.com/release-whl/stable/xpu/us/
+# 或指定版本（以 PyPI 实际存在为准）：
+# pip install intel-extension-for-pytorch==2.1.10+xpu
+
+intel-extension-for-pytorch
