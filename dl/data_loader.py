@@ -414,16 +414,30 @@ def get_sound_api_cache_dataloaders(
     
     print(f"找到 {len(samples)} 个样本")
     
-    # task in {'risk','cls'} 时强制真实标签：从 NPZ→JSON→.f→sidecar 反推补回，再过滤缺失标签
+    # task in {'risk','cls'} 时强制真实标签：
+    # 优先使用 NPZ 内 fault_label，缺失时再走 NPZ→JSON→.f→sidecar 回填。
     if task in ('risk', 'cls'):
-        print(f"{task} 任务：强制使用真实标签（NPZ→JSON→.f→sidecar）...")
+        print(f"{task} 任务：强制使用真实标签（优先 NPZ.fault_label，缺失回退 sidecar）...")
+        fallback_cnt = 0
         for s in samples:
-            s['fault_label'] = resolve_fault_label_from_f_source(s['npz_path'])
+            fault_label = -1
+            npz_path = s['npz_path']
+            try:
+                with np.load(npz_path) as data:
+                    if 'fault_label' in data:
+                        fault_label = int(data['fault_label'])
+            except Exception:
+                fault_label = -1
+            if fault_label < 0:
+                fault_label = resolve_fault_label_from_f_source(npz_path)
+                fallback_cnt += 1
+            s['fault_label'] = fault_label
         n_before = len(samples)
         samples = [s for s in samples if s['fault_label'] >= 0]
         dropped = n_before - len(samples)
         if dropped > 0:
             print(f"  已排除无法从 .f sidecar 解析标签的样本: {dropped} 个")
+        print(f"  sidecar 回退解析次数: {fallback_cnt}")
         if len(samples) == 0:
             raise ValueError(
                 "无有效真实标签。请确认 NPZ 由 build_sound_api_cache 从 convert_mc_to_api_json 的 JSON 构建，"
