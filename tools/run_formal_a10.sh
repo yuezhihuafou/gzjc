@@ -23,25 +23,27 @@ echo "Starting training..."
 echo "run_name=$RUN_NAME"
 echo "log_file=$LOG_FILE"
 
-python experiments/train.py \
-  --data_source sound_api_cache \
-  --task risk \
-  --horizon "$HORIZON" \
-  --cache_dir "$CACHE_DIR" \
-  --device cuda \
-  --amp \
-  --workers "$WORKERS" \
-  --batch_size "$BATCH_SIZE" \
-  --epochs "$EPOCHS" \
-  --lr "$LR" \
-  --sound_split_mode leave_one_condition_out \
-  --condition_policy xjtu_3cond \
-  --calibrate_threshold \
-  --optimizer adamw \
-  --weight_decay 2e-4 \
-  --scheduler cosine \
-  --min_lr 5e-7 \
-  --early_stop_patience 10 \
-  --run_name "$RUN_NAME" \
-  2>&1 | tee "$LOG_FILE"
+CMD=(
+  python experiments/train.py
+  --data_source sound_api_cache
+  --task risk
+  --horizon "$HORIZON"
+  --cache_dir "$CACHE_DIR"
+  --device cuda
+  --amp
+  --workers "$WORKERS"
+  --batch_size "$BATCH_SIZE"
+  --epochs "$EPOCHS"
+  --lr "$LR"
+  --sound_split_mode leave_one_condition_out
+  --condition_policy xjtu_3cond
+  --calibrate_threshold
+  --optimizer adamw
+  --weight_decay 2e-4
+  --scheduler cosine
+  --min_lr 5e-7
+  --early_stop_patience 10
+  --run_name "$RUN_NAME"
+)
 
+"${CMD[@]}" 2>&1 | tee "$LOG_FILE"
