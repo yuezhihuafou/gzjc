@@ -243,25 +243,62 @@ def load_samples_from_cache_dir(cache_dir: str) -> List[Dict]:
 
 def load_samples_from_index(index_path: str, cache_dir: str) -> List[Dict]:
     """
-    从 index.csv 加载样本列表（更可靠，因为 index.csv 已经校验过 t 连续性）
+    从索引文件加载样本列表（支持 index.csv / index.jsonl）
     
     Args:
-        index_path: index.csv 路径
+        index_path: 索引文件路径（.csv 或 .jsonl）
         cache_dir: NPZ 缓存目录（默认: datasets/sound_api/cache_npz）
     
     注意：本函数只读取 NPZ 文件，不读取 JSON 或 xlsx
     """
     cache_path = Path(cache_dir)
-    
-    # 读取 index.csv
+    index_file = Path(index_path)
+
+    if not index_file.exists():
+        raise FileNotFoundError(f"索引文件不存在: {index_path}")
+
+    # 统一解析为 {'bearing_id': str, 't': int}
     records = []
-    with open(index_path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            records.append({
-                'bearing_id': row['bearing_id'],
-                't': int(row['t'])
-            })
+
+    suffix = index_file.suffix.lower()
+    if suffix in ('.jsonl', '.json'):
+        fmt = 'jsonl'
+    elif suffix == '.csv':
+        fmt = 'csv'
+    else:
+        # 无后缀时基于首个非空行探测格式
+        fmt = None
+        with open(index_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                fmt = 'jsonl' if line.startswith('{') else 'csv'
+                break
+        if fmt is None:
+            raise ValueError(f"索引文件为空: {index_path}")
+
+    if fmt == 'jsonl':
+        with open(index_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                records.append({
+                    'bearing_id': str(row['bearing_id']),
+                    't': int(row['t']),
+                })
+    else:
+        with open(index_file, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not row:
+                    continue
+                records.append({
+                    'bearing_id': str(row['bearing_id']),
+                    't': int(row['t']),
+                })
     
     # 按 bearing_id 分组，计算 T
     bearing_groups = defaultdict(list)
