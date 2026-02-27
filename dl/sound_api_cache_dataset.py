@@ -122,12 +122,15 @@ class SoundAPICacheDataset(Dataset):
         npz_path = sample['npz_path']
         
         # 加载 NPZ（上下文内复制所需数组，避免句柄泄漏）
-        with np.load(npz_path) as data:
-            x = data['x'].astype(np.float32)  # (2, 3000)
-            if 'fault_label' in data:
-                fault_label_npz = int(data['fault_label'])
-            else:
-                fault_label_npz = -1
+        try:
+            with np.load(npz_path) as data:
+                x = data['x'].astype(np.float32)  # (2, 3000)
+                if 'fault_label' in data:
+                    fault_label_npz = int(data['fault_label'])
+                else:
+                    fault_label_npz = -1
+        except (EOFError, OSError, ValueError) as e:
+            raise RuntimeError(f"NPZ 损坏或未完整上传，无法加载: {npz_path}") from e
         
         # 分类标签：优先用思路 B 在 data_loader 中已解析的 sample['fault_label']，否则用 NPZ
         if self.task == 'cls':

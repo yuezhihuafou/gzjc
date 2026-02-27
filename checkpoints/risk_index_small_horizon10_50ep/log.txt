@@ -1,0 +1,209 @@
+ /workspace git:(main) python experiments/train.py \
+  --data_source sound_api_cache \
+  --task risk \
+  --cache_dir datasets/sound_api/cache_npz \
+  --horizon 10 \
+  --batch_size 16 \
+  --workers 4 \
+  --epochs 50 \
+  --amp
+使用设备: cuda
+数据源: sound_api_cache
+任务: risk
+批大小: 16, 训练轮数: 50, 学习率: 0.001
+
+加载声音能量曲线数据（从NPZ缓存）...
+扫描缓存目录: datasets/sound_api/cache_npz
+找到 4458 个样本
+
+================================================================================
+数据集划分概况 (Bearing-level Split)
+================================================================================
+总样本数: 4458
+总 bearing 数: 30
+划分比例: Train=70.0%, Val=15.0%, Test=15.0%
+
+训练集: 2631 样本, 21 bearings
+  平均每 bearing: 125.3 样本
+  样本范围: 93 - 461
+
+验证集: 682 样本, 4 bearings
+  平均每 bearing: 170.5 样本
+  样本范围: 93 - 403
+
+测试集: 1145 样本, 5 bearings
+  平均每 bearing: 229.0 样本
+  样本范围: 93 - 463
+================================================================================
+数据集划分 (bearing-level):
+  训练集: 2631 样本 (21 bearings)
+  验证集: 682 样本 (4 bearings)
+  测试集: 1145 样本 (5 bearings)
+计算训练集统计量...
+通道均值: [6.209238  7.5618806]
+通道标准差: [2.4080508 6.182945 ]
+使用混合精度 (AMP) 训练
+
+Epoch [1/50]
+Train Loss: 0.5007 | Train Acc: 0.7815 | Val Loss: 0.9406 | Val Acc: 0.6085 | Val AUC: 0.7781 | Val PR-AUC: 0.9156
+  -> New best model saved (Val AUC: 0.2219)
+
+Epoch [2/50]
+Train Loss: 0.3583 | Train Acc: 0.8377 | Val Loss: 0.4983 | Val Acc: 0.7067 | Val AUC: 0.7789 | Val PR-AUC: 0.9298
+  -> New best model saved (Val AUC: 0.2211)
+
+Epoch [3/50]
+Train Loss: 0.2996 | Train Acc: 0.8529 | Val Loss: 0.5142 | Val Acc: 0.7683 | Val AUC: 0.8091 | Val PR-AUC: 0.9264
+  -> New best model saved (Val AUC: 0.1909)
+
+Epoch [4/50]
+Train Loss: 0.2822 | Train Acc: 0.8674 | Val Loss: 0.4787 | Val Acc: 0.7903 | Val AUC: 0.8273 | Val PR-AUC: 0.9322
+  -> New best model saved (Val AUC: 0.1727)
+
+Epoch [5/50]
+Train Loss: 0.2683 | Train Acc: 0.8731 | Val Loss: 0.5476 | Val Acc: 0.7610 | Val AUC: 0.8315 | Val PR-AUC: 0.9364
+  -> New best model saved (Val AUC: 0.1685)
+
+Epoch [6/50]
+Train Loss: 0.2393 | Train Acc: 0.8864 | Val Loss: 0.6142 | Val Acc: 0.8079 | Val AUC: 0.8208 | Val PR-AUC: 0.9291
+
+Epoch [7/50]
+Train Loss: 0.2580 | Train Acc: 0.8837 | Val Loss: 0.6188 | Val Acc: 0.8094 | Val AUC: 0.8043 | Val PR-AUC: 0.9123
+
+Epoch [8/50]
+Train Loss: 0.2357 | Train Acc: 0.8947 | Val Loss: 0.5278 | Val Acc: 0.7625 | Val AUC: 0.8582 | Val PR-AUC: 0.9525
+  -> New best model saved (Val AUC: 0.1418)
+
+Epoch [9/50]
+Train Loss: 0.2269 | Train Acc: 0.8981 | Val Loss: 0.5034 | Val Acc: 0.7903 | Val AUC: 0.8282 | Val PR-AUC: 0.9427
+
+Epoch [10/50]
+Train Loss: 0.2118 | Train Acc: 0.9084 | Val Loss: 0.5996 | Val Acc: 0.8123 | Val AUC: 0.8420 | Val PR-AUC: 0.9506
+
+Epoch [11/50]
+Train Loss: 0.2116 | Train Acc: 0.9107 | Val Loss: 0.4412 | Val Acc: 0.8284 | Val AUC: 0.8487 | Val PR-AUC: 0.9323
+
+Epoch [12/50]
+Train Loss: 0.1978 | Train Acc: 0.9107 | Val Loss: 0.6899 | Val Acc: 0.7991 | Val AUC: 0.8476 | Val PR-AUC: 0.9447
+
+Epoch [13/50]
+Train Loss: 0.2064 | Train Acc: 0.9107 | Val Loss: 0.9227 | Val Acc: 0.7698 | Val AUC: 0.8527 | Val PR-AUC: 0.9455
+
+Epoch [14/50]
+Train Loss: 0.1926 | Train Acc: 0.9111 | Val Loss: 0.6921 | Val Acc: 0.7551 | Val AUC: 0.7969 | Val PR-AUC: 0.9247
+
+Epoch [15/50]
+Train Loss: 0.1774 | Train Acc: 0.9217 | Val Loss: 0.8281 | Val Acc: 0.7830 | Val AUC: 0.8526 | Val PR-AUC: 0.9415
+
+Epoch [16/50]
+Train Loss: 0.1448 | Train Acc: 0.9437 | Val Loss: 0.8646 | Val Acc: 0.7419 | Val AUC: 0.8331 | Val PR-AUC: 0.9423
+
+Epoch [17/50]
+Train Loss: 0.1685 | Train Acc: 0.9285 | Val Loss: 1.0130 | Val Acc: 0.7082 | Val AUC: 0.8022 | Val PR-AUC: 0.9209
+
+Epoch [18/50]
+Train Loss: 0.1490 | Train Acc: 0.9350 | Val Loss: 0.6748 | Val Acc: 0.8021 | Val AUC: 0.8479 | Val PR-AUC: 0.9490
+
+Epoch [19/50]
+Train Loss: 0.1477 | Train Acc: 0.9407 | Val Loss: 1.3415 | Val Acc: 0.7375 | Val AUC: 0.8136 | Val PR-AUC: 0.9306
+
+Epoch [20/50]
+Train Loss: 0.1566 | Train Acc: 0.9422 | Val Loss: 0.7092 | Val Acc: 0.8123 | Val AUC: 0.8396 | Val PR-AUC: 0.9455
+
+Epoch [21/50]
+Train Loss: 0.1326 | Train Acc: 0.9468 | Val Loss: 0.6014 | Val Acc: 0.8402 | Val AUC: 0.8595 | Val PR-AUC: 0.9409
+  -> New best model saved (Val AUC: 0.1405)
+
+Epoch [22/50]
+Train Loss: 0.1046 | Train Acc: 0.9567 | Val Loss: 0.8944 | Val Acc: 0.7962 | Val AUC: 0.8330 | Val PR-AUC: 0.9375
+
+Epoch [23/50]
+Train Loss: 0.0848 | Train Acc: 0.9700 | Val Loss: 0.8476 | Val Acc: 0.7947 | Val AUC: 0.8268 | Val PR-AUC: 0.9368
+
+Epoch [24/50]
+Train Loss: 0.0987 | Train Acc: 0.9601 | Val Loss: 0.8762 | Val Acc: 0.7654 | Val AUC: 0.8367 | Val PR-AUC: 0.9391
+
+Epoch [25/50]
+Train Loss: 0.1103 | Train Acc: 0.9590 | Val Loss: 0.6669 | Val Acc: 0.8050 | Val AUC: 0.8568 | Val PR-AUC: 0.9522
+
+Epoch [26/50]
+Train Loss: 0.0849 | Train Acc: 0.9688 | Val Loss: 1.4055 | Val Acc: 0.7082 | Val AUC: 0.8380 | Val PR-AUC: 0.9389
+
+Epoch [27/50]
+Train Loss: 0.1193 | Train Acc: 0.9513 | Val Loss: 0.8260 | Val Acc: 0.8065 | Val AUC: 0.8365 | Val PR-AUC: 0.9344
+
+Epoch [28/50]
+Train Loss: 0.0674 | Train Acc: 0.9764 | Val Loss: 1.3568 | Val Acc: 0.7595 | Val AUC: 0.8597 | Val PR-AUC: 0.9524
+  -> New best model saved (Val AUC: 0.1403)
+
+Epoch [29/50]
+Train Loss: 0.0846 | Train Acc: 0.9673 | Val Loss: 0.9240 | Val Acc: 0.7991 | Val AUC: 0.8179 | Val PR-AUC: 0.9295
+
+Epoch [30/50]
+Train Loss: 0.0815 | Train Acc: 0.9719 | Val Loss: 0.8723 | Val Acc: 0.7918 | Val AUC: 0.8447 | Val PR-AUC: 0.9439
+
+Epoch [31/50]
+Train Loss: 0.0555 | Train Acc: 0.9791 | Val Loss: 0.9492 | Val Acc: 0.8123 | Val AUC: 0.8305 | Val PR-AUC: 0.9351
+
+Epoch [32/50]
+Train Loss: 0.0645 | Train Acc: 0.9761 | Val Loss: 0.9352 | Val Acc: 0.8065 | Val AUC: 0.8227 | Val PR-AUC: 0.9339
+
+Epoch [33/50]
+Train Loss: 0.0904 | Train Acc: 0.9631 | Val Loss: 0.5858 | Val Acc: 0.8255 | Val AUC: 0.8852 | Val PR-AUC: 0.9553
+  -> New best model saved (Val AUC: 0.1148)
+
+Epoch [34/50]
+Train Loss: 0.1079 | Train Acc: 0.9597 | Val Loss: 0.7689 | Val Acc: 0.8021 | Val AUC: 0.8224 | Val PR-AUC: 0.9342
+
+Epoch [35/50]
+Train Loss: 0.0733 | Train Acc: 0.9723 | Val Loss: 1.2093 | Val Acc: 0.7757 | Val AUC: 0.8335 | Val PR-AUC: 0.9338
+
+Epoch [36/50]
+Train Loss: 0.0617 | Train Acc: 0.9734 | Val Loss: 1.1925 | Val Acc: 0.7595 | Val AUC: 0.8407 | Val PR-AUC: 0.9435
+
+Epoch [37/50]
+Train Loss: 0.0678 | Train Acc: 0.9757 | Val Loss: 1.2251 | Val Acc: 0.7581 | Val AUC: 0.8195 | Val PR-AUC: 0.9401
+
+Epoch [38/50]
+Train Loss: 0.0923 | Train Acc: 0.9658 | Val Loss: 0.6537 | Val Acc: 0.8299 | Val AUC: 0.8676 | Val PR-AUC: 0.9552
+
+Epoch [39/50]
+Train Loss: 0.0298 | Train Acc: 0.9935 | Val Loss: 1.0731 | Val Acc: 0.8270 | Val AUC: 0.8677 | Val PR-AUC: 0.9542
+
+Epoch [40/50]
+Train Loss: 0.0615 | Train Acc: 0.9768 | Val Loss: 1.0812 | Val Acc: 0.7859 | Val AUC: 0.8251 | Val PR-AUC: 0.9343
+
+Epoch [41/50]
+Train Loss: 0.0649 | Train Acc: 0.9742 | Val Loss: 0.8839 | Val Acc: 0.7815 | Val AUC: 0.8509 | Val PR-AUC: 0.9523
+
+Epoch [42/50]
+Train Loss: 0.0553 | Train Acc: 0.9802 | Val Loss: 0.9082 | Val Acc: 0.8138 | Val AUC: 0.8410 | Val PR-AUC: 0.9354
+
+Epoch [43/50]
+Train Loss: 0.0622 | Train Acc: 0.9745 | Val Loss: 1.0143 | Val Acc: 0.7874 | Val AUC: 0.8112 | Val PR-AUC: 0.9221
+
+Epoch [44/50]
+Train Loss: 0.0843 | Train Acc: 0.9669 | Val Loss: 0.8948 | Val Acc: 0.8196 | Val AUC: 0.8404 | Val PR-AUC: 0.9399
+
+Epoch [45/50]
+Train Loss: 0.0325 | Train Acc: 0.9886 | Val Loss: 1.1163 | Val Acc: 0.7903 | Val AUC: 0.8270 | Val PR-AUC: 0.9316
+
+Epoch [46/50]
+Train Loss: 0.0364 | Train Acc: 0.9840 | Val Loss: 1.6236 | Val Acc: 0.6745 | Val AUC: 0.8403 | Val PR-AUC: 0.9371
+
+Epoch [47/50]
+Train Loss: 0.0539 | Train Acc: 0.9795 | Val Loss: 1.1118 | Val Acc: 0.7933 | Val AUC: 0.8209 | Val PR-AUC: 0.9315
+
+Epoch [48/50]
+Train Loss: 0.0631 | Train Acc: 0.9772 | Val Loss: 0.8726 | Val Acc: 0.8094 | Val AUC: 0.8565 | Val PR-AUC: 0.9531
+
+Epoch [49/50]
+Train Loss: 0.0637 | Train Acc: 0.9772 | Val Loss: 3.1412 | Val Acc: 0.5938 | Val AUC: 0.8254 | Val PR-AUC: 0.9381
+
+Epoch [50/50]
+Train Loss: 0.0595 | Train Acc: 0.9791 | Val Loss: 0.9184 | Val Acc: 0.8079 | Val AUC: 0.8508 | Val PR-AUC: 0.9471
+
+================================================================================
+测试集评估
+================================================================================
+Test Loss: 0.5702 | Test Acc: 0.8541 | Test AUC: 0.9286 | Test PR-AUC: 0.9713

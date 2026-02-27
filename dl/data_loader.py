@@ -73,6 +73,12 @@ def _load_numpy_arrays(
     signals = np.load(signals_path)  # 期望形状: (N, 2, L)
     labels = np.load(labels_path)    # 期望形状: (N,)
 
+    # 兼容旧版/单通道数据：(N, L) 或 (N, 1, L) -> (N, 2, L)
+    if signals.ndim == 2:
+        signals = np.stack([signals, signals], axis=1)
+    elif signals.ndim == 3 and signals.shape[1] == 1:
+        signals = np.concatenate([signals, signals], axis=1)
+
     if signals.ndim != 3 or signals.shape[1] != 2:
         raise ValueError(
             f"signals 期望形状为 (N, 2, L)，实际为: {signals.shape}"
@@ -264,20 +270,32 @@ def get_sound_api_cache_dataloaders(
     print(f"  验证集: {len(val_samples)} 样本 ({len(set(s['bearing_id'] for s in val_samples))} bearings)")
     print(f"  测试集: {len(test_samples)} 样本 ({len(set(s['bearing_id'] for s in test_samples))} bearings)")
     
-    # 在训练集上计算通道均值/方差
+    # 在训练集上计算通道均值/方差（跳过损坏/不完整 NPZ，如上传不完整导致的 EOFError）
     print("计算训练集统计量...")
     train_volumes = []
     train_densities = []
-    
+    bad_npz_paths = set()
+
     for sample in train_samples:
         npz_path = sample['npz_path']
-        with np.load(npz_path) as data:
-            x = data['x'].astype(np.float32)  # (2, 3000)
-        train_volumes.append(x[0])  # log1p(volume)
-        train_densities.append(x[1])  # density
-    
+        try:
+            with np.load(npz_path) as data:
+                x = data['x'].astype(np.float32)  # (2, 3000)
+            train_volumes.append(x[0])  # log1p(volume)
+            train_densities.append(x[1])  # density
+        except (EOFError, OSError, ValueError) as e:
+            bad_npz_paths.add(str(npz_path))
+
+    if bad_npz_paths:
+        n_bad = len(bad_npz_paths)
+        train_samples = [s for s in train_samples if str(s['npz_path']) not in bad_npz_paths]
+        val_samples = [s for s in val_samples if str(s['npz_path']) not in bad_npz_paths]
+        test_samples = [s for s in test_samples if str(s['npz_path']) not in bad_npz_paths]
+        print(f"已跳过 {n_bad} 个损坏/不完整的 NPZ 文件（如 EOFError: No data left in file）")
+        print(f"  过滤后: 训练 {len(train_samples)}, 验证 {len(val_samples)}, 测试 {len(test_samples)}")
+
     if len(train_volumes) == 0:
-        raise ValueError("训练集为空，无法计算统计量")
+        raise ValueError("训练集为空或全部 NPZ 损坏，无法计算统计量。请检查上传的 NPZ 是否完整。")
     
     all_volumes = np.concatenate(train_volumes)
     all_densities = np.concatenate(train_densities)
@@ -347,5 +365,4 @@ def get_sound_api_cache_dataloaders(
 
 
 __all__ = ["LieGroupDataset", "get_dataloaders", "get_sound_api_cache_dataloaders"]
-
 
