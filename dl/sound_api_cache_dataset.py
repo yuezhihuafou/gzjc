@@ -172,6 +172,8 @@ class SoundAPICacheDataset(Dataset):
             'bearing_id': bearing_id,
             't': t,
             'T': T,
+            'condition_id': sample.get('condition_id', ''),
+            'fault_label': int(fault_label) if fault_label is not None else -1,
             'npz_path': str(npz_path)
         }
         

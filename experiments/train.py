@@ -17,6 +17,7 @@ import sys
 import argparse
 import csv
 import json
+import random
 from datetime import datetime
 from typing import Tuple, Dict, List, Optional
 from pathlib import Path
@@ -593,6 +594,51 @@ def save_risk_predictions_csv(
             ])
 
 
+def save_risk_condition_metrics_csv(
+    csv_path: Path,
+    preds: np.ndarray,
+    targets: np.ndarray,
+    meta: List,
+    threshold: float = 0.5,
+) -> None:
+    """按 condition_id 导出 risk 指标，便于跨工况分析。"""
+    groups: Dict[str, List[int]] = {}
+    for i in range(len(preds)):
+        m = meta[i] if i < len(meta) else {}
+        cid = str(m.get("condition_id", "unknown") or "unknown")
+        groups.setdefault(cid, []).append(i)
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["condition_id", "n_samples", "acc", "auc", "pr_auc"])
+        for cid in sorted(groups.keys()):
+            idx = groups[cid]
+            p = preds[idx]
+            t = targets[idx]
+            acc = float(np.mean((p > threshold).astype(np.float32) == t.astype(np.float32)))
+            auc = ""
+            pr_auc = ""
+            try:
+                from sklearn.metrics import roc_auc_score, average_precision_score
+                if np.unique(t).size >= 2:
+                    auc = float(roc_auc_score(t, p))
+                    pr_auc = float(average_precision_score(t, p))
+            except Exception:
+                pass
+            writer.writerow([cid, len(idx), acc, auc, pr_auc])
+
+
+def set_global_seed(seed: int, deterministic: bool = False) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = bool(deterministic)
+        torch.backends.cudnn.benchmark = not bool(deterministic)
+
+
 def main():
     parser = argparse.ArgumentParser(description='训练模型')
     parser.add_argument(
@@ -831,6 +877,17 @@ def main():
         help='使用混合精度 (FP16) 训练，加速并省显存（仅 CUDA）'
     )
     parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help='全局随机种子（默认 42）'
+    )
+    parser.add_argument(
+        '--deterministic',
+        action='store_true',
+        help='启用确定性模式（更可复现，但可能略慢）'
+    )
+    parser.add_argument(
         '--model_scale',
         type=str,
         choices=['base', 'large'],
@@ -872,6 +929,8 @@ def main():
     if args.eval_only and args.fast_eval:
         if not args.max_test_samples or args.max_test_samples > 64:
             args.max_test_samples = 64
+
+    set_global_seed(args.seed, deterministic=args.deterministic)
     
     # 参数提示：risk 任务现使用真实 fault_label，不再强制依赖 horizon
     if args.task == 'risk' and args.horizon is None:
@@ -933,6 +992,7 @@ def main():
     print(f"任务: {args.task}")
     print(f"批大小: {batch_size}, 训练轮数: {epochs}, 学习率: {lr}")
     print(f"模型规模: {args.model_scale}, embedding_dim: {embedding_dim}")
+    print(f"随机种子: {args.seed}, deterministic={args.deterministic}")
     if args.data_source == "sound_api_cache":
         print("运行模式: XJTU 优先主线（sound_api_cache）")
     elif args.data_source == "cwru":
@@ -947,6 +1007,7 @@ def main():
         plots_dir = outputs_dir / "plots"
         metrics_path = outputs_dir / "metrics.csv"
         risk_pred_path = outputs_dir / "risk_predictions.csv"
+        risk_cond_metrics_path = outputs_dir / "risk_condition_metrics.csv"
     else:
         run_name = args.run_name or build_run_name(args)
         run_dir = Path(args.runs_root) / run_name
@@ -955,6 +1016,7 @@ def main():
         plots_dir = outputs_dir / "plots"
         metrics_path = outputs_dir / "metrics.csv"
         risk_pred_path = outputs_dir / "risk_predictions.csv"
+        risk_cond_metrics_path = outputs_dir / "risk_condition_metrics.csv"
         ckpt_out_dir.mkdir(parents=True, exist_ok=True)
         plots_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "outputs" / "splits").mkdir(parents=True, exist_ok=True)
@@ -996,6 +1058,7 @@ def main():
             task=args.task,
             horizon=args.horizon,
             num_workers=workers,
+            seed=args.seed,
         )
         split_dump_dir = args.split_dump_dir
         if not args.no_archive and split_dump_dir == 'experiments/outputs/splits':
@@ -1021,6 +1084,7 @@ def main():
             label_version=args.label_version,
             test_condition_id=args.test_condition_id,
             num_workers=workers,
+            seed=args.seed,
         )
         dump_split_files_for_cwru(
             train_loader=train_loader,
@@ -1167,6 +1231,9 @@ def main():
                 plot_risk_predictions(test_preds, test_targets, test_meta, str(plots_dir))
                 save_risk_predictions_csv(
                     risk_pred_path, test_preds, test_targets, test_meta, threshold=best_risk_threshold
+                )
+                save_risk_condition_metrics_csv(
+                    risk_cond_metrics_path, test_preds, test_targets, test_meta, threshold=best_risk_threshold
                 )
         else:
             test_loss, test_acc = eval_fn(backbone, head, criterion, test_loader, device)
@@ -1328,6 +1395,9 @@ def main():
         save_risk_predictions_csv(
             risk_pred_path, test_preds, test_targets, test_meta, threshold=best_risk_threshold
         )
+        save_risk_condition_metrics_csv(
+            risk_cond_metrics_path, test_preds, test_targets, test_meta, threshold=best_risk_threshold
+        )
         
         # 保存指标
         save_metrics_csv(metrics_path, {
@@ -1361,6 +1431,8 @@ def main():
             outputs_dir / "splits",
             plots_dir,
         ]
+        if args.task == "risk":
+            required_paths.append(outputs_dir / "risk_condition_metrics.csv")
         missing = [str(p) for p in required_paths if not p.exists()]
         if missing:
             print("警告: 归档存在缺失项:")

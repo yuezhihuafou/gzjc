@@ -2,6 +2,8 @@ import os
 import csv
 import json
 import re
+import hashlib
+from pathlib import Path
 from typing import Tuple, Optional, Dict, List
 
 import numpy as np
@@ -474,21 +476,64 @@ def get_sound_api_cache_dataloaders(
     print(f"  验证集: {len(val_samples)} 样本 ({len(set(s['bearing_id'] for s in val_samples))} bearings)")
     print(f"  测试集: {len(test_samples)} 样本 ({len(set(s['bearing_id'] for s in test_samples))} bearings)")
     
-    # 在训练集上计算通道均值/方差（跳过损坏/不完整 NPZ，如上传不完整导致的 EOFError）
+    # 在训练集上计算通道均值/方差（带缓存，加速后续重复训练）
     print("计算训练集统计量...")
-    train_volumes = []
-    train_densities = []
-    bad_npz_paths = set()
+    h = hashlib.sha1()
+    h.update(f"{split_mode}|{task}|{len(train_samples)}".encode("utf-8"))
+    train_paths = sorted(str(s.get("npz_path", "")) for s in train_samples)
+    for p in train_paths:
+        h.update(p.encode("utf-8"))
+        h.update(b"\n")
+    stats_key = h.hexdigest()[:16]
+    stats_dir = Path(cache_dir) / "_stats_cache"
+    stats_dir.mkdir(parents=True, exist_ok=True)
+    stats_path = stats_dir / f"stats_{stats_key}.json"
 
-    for sample in train_samples:
-        npz_path = sample['npz_path']
+    bad_npz_paths = set()
+    if stats_path.exists():
         try:
-            with np.load(npz_path) as data:
-                x = data['x'].astype(np.float32)  # (2, 3000)
-            train_volumes.append(x[0])  # log1p(volume)
-            train_densities.append(x[1])  # density
-        except (EOFError, OSError, ValueError) as e:
-            bad_npz_paths.add(str(npz_path))
+            obj = json.loads(stats_path.read_text(encoding="utf-8"))
+            channel_mean = np.array(obj["channel_mean"], dtype=np.float32)
+            channel_std = np.array(obj["channel_std"], dtype=np.float32)
+            bad_npz_paths = set(obj.get("bad_npz_paths", []))
+            print(f"命中统计量缓存: {stats_path.name}")
+        except Exception:
+            channel_mean = None
+            channel_std = None
+            bad_npz_paths = set()
+    else:
+        channel_mean = None
+        channel_std = None
+
+    if channel_mean is None or channel_std is None:
+        train_volumes = []
+        train_densities = []
+        bad_npz_paths = set()
+        for sample in train_samples:
+            npz_path = sample['npz_path']
+            try:
+                with np.load(npz_path) as data:
+                    x = data['x'].astype(np.float32)  # (2, 3000)
+                train_volumes.append(x[0])  # log1p(volume)
+                train_densities.append(x[1])  # density
+            except (EOFError, OSError, ValueError):
+                bad_npz_paths.add(str(npz_path))
+
+        if len(train_volumes) == 0:
+            raise ValueError("训练集为空或全部 NPZ 损坏，无法计算统计量。请检查上传的 NPZ 是否完整。")
+
+        all_volumes = np.concatenate(train_volumes)
+        all_densities = np.concatenate(train_densities)
+        channel_mean = np.array([np.mean(all_volumes), np.mean(all_densities)], dtype=np.float32)
+        channel_std = np.array([np.std(all_volumes), np.std(all_densities)], dtype=np.float32)
+
+        stats_obj = {
+            "channel_mean": channel_mean.tolist(),
+            "channel_std": channel_std.tolist(),
+            "bad_npz_paths": sorted(list(bad_npz_paths)),
+        }
+        stats_path.write_text(json.dumps(stats_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"统计量缓存已写入: {stats_path.name}")
 
     if bad_npz_paths:
         n_bad = len(bad_npz_paths)
@@ -498,15 +543,6 @@ def get_sound_api_cache_dataloaders(
         print(f"已跳过 {n_bad} 个损坏/不完整的 NPZ 文件（如 EOFError: No data left in file）")
         print(f"  过滤后: 训练 {len(train_samples)}, 验证 {len(val_samples)}, 测试 {len(test_samples)}")
 
-    if len(train_volumes) == 0:
-        raise ValueError("训练集为空或全部 NPZ 损坏，无法计算统计量。请检查上传的 NPZ 是否完整。")
-    
-    all_volumes = np.concatenate(train_volumes)
-    all_densities = np.concatenate(train_densities)
-    
-    channel_mean = np.array([np.mean(all_volumes), np.mean(all_densities)])
-    channel_std = np.array([np.std(all_volumes), np.std(all_densities)])
-    
     print(f"通道均值: {channel_mean}")
     print(f"通道标准差: {channel_std}")
     
