@@ -46,21 +46,25 @@ CLASS_ID_TO_NAME = {0: "Normal", 1: "B", 2: "IR", 3: "OR"}
 
 class RegressionHead(nn.Module):
     """回归头：输出单个标量"""
-    def __init__(self, in_features: int = 512):
+    def __init__(self, in_features: int = 512, dropout: float = 0.0):
         super().__init__()
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
         self.fc = nn.Linear(in_features, 1)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.dropout(x)
         return self.fc(x).squeeze(-1)  # (B,)
 
 
 class BinaryClassificationHead(nn.Module):
     """二分类头：输出单个 logit"""
-    def __init__(self, in_features: int = 512):
+    def __init__(self, in_features: int = 512, dropout: float = 0.0):
         super().__init__()
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
         self.fc = nn.Linear(in_features, 1)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.dropout(x)
         return self.fc(x).squeeze(-1)  # (B,)
 
 
@@ -890,15 +894,21 @@ def main():
     parser.add_argument(
         '--model_scale',
         type=str,
-        choices=['base', 'large'],
+        choices=['base', 'large', 'xlarge'],
         default='base',
-        help='模型规模：base(默认) 或 large(扩容版)'
+        help='模型规模：base(默认) / large / xlarge(更大)'
     )
     parser.add_argument(
         '--embedding_dim',
         type=int,
         default=None,
-        help='embedding 维度（默认: base=512, large=768）'
+        help='embedding 维度（默认: base=512, large=768, xlarge=1024）'
+    )
+    parser.add_argument(
+        '--head_dropout',
+        type=float,
+        default=0.0,
+        help='头部 dropout 比例（默认 0.0，扩容模型可用 0.1）'
     )
     parser.add_argument(
         '--runs_root',
@@ -946,7 +956,14 @@ def main():
     epochs = args.epochs
     lr = args.lr
     split_ratio = tuple(args.split_ratio)
-    embedding_dim = args.embedding_dim if args.embedding_dim else (768 if args.model_scale == "large" else 512)
+    if args.embedding_dim:
+        embedding_dim = args.embedding_dim
+    elif args.model_scale == "xlarge":
+        embedding_dim = 1024
+    elif args.model_scale == "large":
+        embedding_dim = 768
+    else:
+        embedding_dim = 512
 
     if args.device is not None:
         if args.device not in ('cuda', 'cpu', 'xpu', 'dml'):
@@ -991,7 +1008,7 @@ def main():
     print(f"数据源: {args.data_source}")
     print(f"任务: {args.task}")
     print(f"批大小: {batch_size}, 训练轮数: {epochs}, 学习率: {lr}")
-    print(f"模型规模: {args.model_scale}, embedding_dim: {embedding_dim}")
+    print(f"模型规模: {args.model_scale}, embedding_dim: {embedding_dim}, head_dropout: {args.head_dropout}")
     print(f"随机种子: {args.seed}, deterministic={args.deterministic}")
     if args.data_source == "sound_api_cache":
         print("运行模式: XJTU 优先主线（sound_api_cache）")
@@ -1110,7 +1127,7 @@ def main():
             raise
 
     if args.task == 'hi':
-        head = RegressionHead(in_features=embedding_dim).to(device)
+        head = RegressionHead(in_features=embedding_dim, dropout=args.head_dropout).to(device)
         criterion = nn.MSELoss()
         train_fn = train_one_epoch_regression
         if args.data_source == 'sound_api_cache':
@@ -1118,7 +1135,7 @@ def main():
         else:
             eval_fn = lambda b, h, c, d, dev: (0.0, 0.0)  # 占位
     elif args.task == 'risk':
-        head = BinaryClassificationHead(in_features=embedding_dim).to(device)
+        head = BinaryClassificationHead(in_features=embedding_dim, dropout=args.head_dropout).to(device)
         criterion = nn.BCEWithLogitsLoss()
         train_fn = train_one_epoch_binary
         if args.data_source == 'sound_api_cache':

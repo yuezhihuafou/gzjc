@@ -8,15 +8,16 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-RUN_NAME="${RUN_NAME:-formal_a10_loco_real_large_bs768_lr3e3}"
+RUN_NAME="${RUN_NAME:-formal_a10_loco_real_xlarge_bs640_lr2e3}"
 CACHE_DIR="${CACHE_DIR:-datasets/sound_api/cache_npz}"
 WORKERS="${WORKERS:-20}"
-BATCH_SIZE="${BATCH_SIZE:-768}"
+BATCH_SIZE="${BATCH_SIZE:-640}"
 EPOCHS="${EPOCHS:-50}"
-LR="${LR:-0.0030}"
+LR="${LR:-0.0020}"
 HORIZON="${HORIZON:-10}"
-MODEL_SCALE="${MODEL_SCALE:-large}"
-EMBEDDING_DIM="${EMBEDDING_DIM:-768}"
+MODEL_SCALE="${MODEL_SCALE:-xlarge}"
+EMBEDDING_DIM="${EMBEDDING_DIM:-1024}"
+HEAD_DROPOUT="${HEAD_DROPOUT:-0.1}"
 
 mkdir -p experiments/logs
 LOG_FILE="experiments/logs/${RUN_NAME}.log"
@@ -35,6 +36,7 @@ CMD=(
   --amp
   --model_scale "$MODEL_SCALE"
   --embedding_dim "$EMBEDDING_DIM"
+  --head_dropout "$HEAD_DROPOUT"
   --workers "$WORKERS"
   --batch_size "$BATCH_SIZE"
   --epochs "$EPOCHS"

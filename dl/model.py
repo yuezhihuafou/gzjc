@@ -134,7 +134,9 @@ def build_backbone(
     """
     便捷构造函数，供训练和推理脚本使用。
     """
-    if model_scale == "large":
+    if model_scale == "xlarge":
+        base_channels = 128
+    elif model_scale == "large":
         base_channels = 96
     else:
         base_channels = 64
