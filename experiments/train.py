@@ -16,6 +16,7 @@ import os
 import sys
 import argparse
 import csv
+import json
 from typing import Tuple, Dict, List, Optional
 from pathlib import Path
 
@@ -435,21 +436,66 @@ def plot_risk_predictions(preds: np.ndarray, targets: np.ndarray, meta: List, ou
         plt.close()
 
 
+def dump_split_files_for_cwru(
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    test_loader: DataLoader,
+    split_dump_dir: str,
+) -> None:
+    """导出切分索引与工况统计，便于复现实验。"""
+    output_dir = Path(split_dump_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _extract(dataset):
+        indices = [int(i) for i in dataset.indices.tolist()]
+        condition_counts: Dict[str, int] = {}
+        cond_ids = getattr(dataset, "condition_ids", None)
+        if cond_ids is not None:
+            for idx in indices:
+                cid = str(cond_ids[idx])
+                condition_counts[cid] = condition_counts.get(cid, 0) + 1
+        return indices, condition_counts
+
+    train_indices, train_conditions = _extract(train_loader.dataset)
+    val_indices, val_conditions = _extract(val_loader.dataset)
+    test_indices, test_conditions = _extract(test_loader.dataset)
+
+    (output_dir / "train_indices.json").write_text(
+        json.dumps(train_indices, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (output_dir / "val_indices.json").write_text(
+        json.dumps(val_indices, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (output_dir / "test_indices.json").write_text(
+        json.dumps(test_indices, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (output_dir / "train_conditions.json").write_text(
+        json.dumps(train_conditions, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (output_dir / "val_conditions.json").write_text(
+        json.dumps(val_conditions, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (output_dir / "test_conditions.json").write_text(
+        json.dumps(test_conditions, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(f"切分文件已导出: {output_dir}")
+
+
 def main():
     parser = argparse.ArgumentParser(description='训练模型')
     parser.add_argument(
         '--data_source',
         type=str,
         choices=['cwru', 'sound', 'sound_api', 'sound_api_cache'],
-        default='cwru',
-        help='数据源'
+        default='sound_api_cache',
+        help='数据源（默认 sound_api_cache，作为 XJTU 主线训练入口）'
     )
     parser.add_argument(
         '--task',
         type=str,
         choices=['hi', 'risk', 'arcface'],
-        default='arcface',
-        help='任务类型: hi (健康指数回归), risk (风险预测), arcface (分类)'
+        default='risk',
+        help='任务类型: hi (健康指数回归), risk (风险预测/故障检测), arcface (分类)'
     )
     parser.add_argument(
         '--batch_size',
@@ -475,6 +521,49 @@ def main():
         nargs=3,
         default=[0.7, 0.15, 0.15],
         help='数据集划分比例 [train val test]'
+    )
+    parser.add_argument(
+        '--split_mode',
+        type=str,
+        choices=['random', 'leave_one_condition_out'],
+        default='random',
+        help='CWRU 切分方式: random 或 leave_one_condition_out'
+    )
+    parser.add_argument(
+        '--base_dir',
+        type=str,
+        default='cwru_processed',
+        help='CWRU 处理后数据目录 (signals.npy/labels.npy)'
+    )
+    parser.add_argument(
+        '--master_labels_path',
+        type=str,
+        default=None,
+        help='统一标签表 CSV 路径，包含 sample_id/fault_binary/condition_id'
+    )
+    parser.add_argument(
+        '--label_source_policy',
+        type=str,
+        default='any',
+        help='标签来源过滤策略: any/dataset_rule/alarm/manual'
+    )
+    parser.add_argument(
+        '--label_version',
+        type=str,
+        default='latest',
+        help='标签版本过滤，latest 表示不过滤版本'
+    )
+    parser.add_argument(
+        '--test_condition_id',
+        type=str,
+        default=None,
+        help='leave_one_condition_out 时指定测试工况 ID'
+    )
+    parser.add_argument(
+        '--split_dump_dir',
+        type=str,
+        default='experiments/outputs/splits',
+        help='切分导出目录'
     )
     parser.add_argument(
         '--horizon',
@@ -520,6 +609,11 @@ def main():
         help='仅加载 checkpoint 在测试集上评估，不训练'
     )
     parser.add_argument(
+        '--allow_cwru_train',
+        action='store_true',
+        help='允许在 CWRU 上训练（默认关闭，CWRU 仅用于评估）'
+    )
+    parser.add_argument(
         '--checkpoint_dir',
         type=str,
         default='checkpoints',
@@ -557,7 +651,13 @@ def main():
     )
     
     args = parser.parse_args()
-    
+
+    # 默认策略：XJTU 主线训练，CWRU 仅评估
+    if args.data_source == 'cwru' and (not args.allow_cwru_train) and (not args.eval_only):
+        args.eval_only = True
+        print("策略提示: 当前默认将 CWRU 作为评估集，已自动启用 --eval_only。")
+        print("如需在 CWRU 上训练，请显式添加 --allow_cwru_train。")
+
     if args.eval_only and args.fast_eval:
         if not args.max_test_samples or args.max_test_samples > 64:
             args.max_test_samples = 64
@@ -620,6 +720,11 @@ def main():
     print(f"数据源: {args.data_source}")
     print(f"任务: {args.task}")
     print(f"批大小: {batch_size}, 训练轮数: {epochs}, 学习率: {lr}")
+    if args.data_source == "sound_api_cache":
+        print("运行模式: XJTU 优先主线（sound_api_cache）")
+    elif args.data_source == "cwru":
+        mode = "仅评估" if args.eval_only and not args.allow_cwru_train else "训练/评估"
+        print(f"运行模式: CWRU {mode}")
 
     # 数据加载
     workers = getattr(args, 'workers', 0)
@@ -658,7 +763,19 @@ def main():
         train_loader, val_loader, test_loader = get_dataloaders(
             batch_size=batch_size,
             split_ratio=split_ratio,
+            base_dir=args.base_dir,
+            split_mode=args.split_mode,
+            master_labels_path=args.master_labels_path,
+            label_source_policy=args.label_source_policy,
+            label_version=args.label_version,
+            test_condition_id=args.test_condition_id,
             num_workers=workers,
+        )
+        dump_split_files_for_cwru(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            split_dump_dir=args.split_dump_dir,
         )
 
     # 模型初始化（DirectML 对部分 1D 算子支持有限，失败则回退 CPU）

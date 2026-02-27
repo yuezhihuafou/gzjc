@@ -1,5 +1,6 @@
 import os
-from typing import Tuple, Optional
+import csv
+from typing import Tuple, Optional, Dict, List
 
 import numpy as np
 import torch
@@ -27,12 +28,14 @@ class LieGroupDataset(Dataset):
         indices: np.ndarray,
         channel_mean: np.ndarray,
         channel_std: np.ndarray,
+        condition_ids: Optional[np.ndarray] = None,
     ) -> None:
         super().__init__()
 
         self.signals = signals
         self.labels = labels.astype(np.int64)
         self.indices = indices.astype(np.int64)
+        self.condition_ids = condition_ids if condition_ids is not None else None
 
         # (2,) 通道均值与方差
         self.channel_mean = channel_mean.reshape(2, 1)
@@ -95,6 +98,12 @@ def get_dataloaders(
     batch_size: int = 64,
     split_ratio: Tuple[float, float, float] = (0.7, 0.15, 0.15),
     base_dir: str = "cwru_processed",
+    split_mode: str = "random",
+    master_labels_path: Optional[str] = None,
+    label_source_policy: str = "any",
+    label_version: str = "latest",
+    test_condition_id: Optional[str] = None,
+    seed: int = 42,
     num_workers: int = 0,
     shuffle: bool = True,
     pin_memory: Optional[bool] = None,
@@ -109,6 +118,17 @@ def get_dataloaders(
         - 所有子集都使用同一组 mean/std。
     """
     signals, labels = _load_numpy_arrays(base_dir=base_dir)
+    condition_ids = None
+
+    # 优先从 master_labels 读取统一真值标签（single source of truth）
+    if master_labels_path and os.path.exists(master_labels_path):
+        labels, condition_ids = _load_labels_from_master_table(
+            master_labels_path=master_labels_path,
+            n_samples=signals.shape[0],
+            fallback_labels=labels,
+            label_source_policy=label_source_policy,
+            label_version=label_version,
+        )
 
     n_samples = signals.shape[0]
 
@@ -121,15 +141,30 @@ def get_dataloaders(
     n_val = int(n_samples * val_ratio)
     n_test = n_samples - n_train - n_val
 
-    # 生成打乱后的索引
-    all_indices = np.arange(n_samples)
-    if shuffle:
-        rng = np.random.default_rng(seed=42)
-        rng.shuffle(all_indices)
+    if split_mode not in ("random", "leave_one_condition_out"):
+        raise ValueError("split_mode 仅支持 'random' 或 'leave_one_condition_out'")
 
-    train_indices = all_indices[:n_train]
-    val_indices = all_indices[n_train : n_train + n_val]
-    test_indices = all_indices[n_train + n_val :]
+    if split_mode == "leave_one_condition_out":
+        if condition_ids is None:
+            raise ValueError(
+                "split_mode=leave_one_condition_out 需要 master_labels 中包含 condition_id 字段"
+            )
+        train_indices, val_indices, test_indices = _split_leave_one_condition_out(
+            condition_ids=condition_ids,
+            split_ratio=split_ratio,
+            test_condition_id=test_condition_id,
+            seed=seed,
+        )
+    else:
+        # 生成打乱后的索引
+        all_indices = np.arange(n_samples)
+        if shuffle:
+            rng = np.random.default_rng(seed=seed)
+            rng.shuffle(all_indices)
+
+        train_indices = all_indices[:n_train]
+        val_indices = all_indices[n_train : n_train + n_val]
+        test_indices = all_indices[n_train + n_val :]
 
     # 在训练集上计算通道均值 / 方差
     # signals_train: (N_train, 2, L)
@@ -139,9 +174,15 @@ def get_dataloaders(
     channel_std = signals_train.std(axis=(0, 2))
 
     # 构建 Dataset
-    train_dataset = LieGroupDataset(signals, labels, train_indices, channel_mean, channel_std)
-    val_dataset = LieGroupDataset(signals, labels, val_indices, channel_mean, channel_std)
-    test_dataset = LieGroupDataset(signals, labels, test_indices, channel_mean, channel_std)
+    train_dataset = LieGroupDataset(
+        signals, labels, train_indices, channel_mean, channel_std, condition_ids=condition_ids
+    )
+    val_dataset = LieGroupDataset(
+        signals, labels, val_indices, channel_mean, channel_std, condition_ids=condition_ids
+    )
+    test_dataset = LieGroupDataset(
+        signals, labels, test_indices, channel_mean, channel_std, condition_ids=condition_ids
+    )
 
     # DataLoader 通用参数（num_workers>0 时保持 worker 进程不退出，减少每 epoch 重启开销）
     if pin_memory is None:
@@ -174,6 +215,130 @@ def get_dataloaders(
     )
 
     return train_loader, val_loader, test_loader
+
+
+def _load_labels_from_master_table(
+    master_labels_path: str,
+    n_samples: int,
+    fallback_labels: np.ndarray,
+    label_source_policy: str = "any",
+    label_version: str = "latest",
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    从统一标签表读取 fault_binary 与 condition_id。
+    支持按 label_source / label_version 过滤，不满足过滤条件时退回 fallback_labels。
+    """
+    rows: List[Dict[str, str]] = []
+    with open(master_labels_path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+
+    if len(rows) == 0:
+        raise ValueError(f"master_labels 为空: {master_labels_path}")
+
+    selected = rows
+    if label_source_policy != "any":
+        selected = [r for r in selected if r.get("label_source", "") == label_source_policy]
+        if len(selected) == 0:
+            raise ValueError(
+                f"master_labels 过滤后为空: label_source_policy={label_source_policy}"
+            )
+
+    if label_version != "latest":
+        selected = [r for r in selected if r.get("label_version", "") == label_version]
+        if len(selected) == 0:
+            raise ValueError(
+                f"master_labels 过滤后为空: label_version={label_version}"
+            )
+
+    by_sample_id = {}
+    for r in selected:
+        sid = r.get("sample_id")
+        if sid is not None and sid != "":
+            try:
+                by_sample_id[int(sid)] = r
+            except ValueError:
+                continue
+
+    out_labels = np.asarray(fallback_labels, dtype=np.int64).copy()
+    out_condition_ids = np.array(["unknown"] * n_samples, dtype=object)
+
+    if len(by_sample_id) >= n_samples:
+        for i in range(n_samples):
+            r = by_sample_id.get(i)
+            if r is None:
+                continue
+            fb = r.get("fault_binary")
+            if fb not in (None, ""):
+                out_labels[i] = int(float(fb))
+            out_condition_ids[i] = r.get("condition_id", "unknown") or "unknown"
+    else:
+        if len(selected) != n_samples:
+            raise ValueError(
+                f"master_labels 样本数不匹配: selected={len(selected)}, n_samples={n_samples}"
+            )
+        for i, r in enumerate(selected):
+            fb = r.get("fault_binary")
+            if fb not in (None, ""):
+                out_labels[i] = int(float(fb))
+            out_condition_ids[i] = r.get("condition_id", "unknown") or "unknown"
+
+    return out_labels, out_condition_ids
+
+
+def _split_leave_one_condition_out(
+    condition_ids: np.ndarray,
+    split_ratio: Tuple[float, float, float],
+    test_condition_id: Optional[str] = None,
+    seed: int = 42,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """按工况切分：测试集固定一个 condition，验证集固定另一个 condition。"""
+    unique_conditions = np.unique(condition_ids)
+    if unique_conditions.shape[0] < 2:
+        raise ValueError("leave_one_condition_out 至少需要 2 个不同工况")
+
+    cond_to_idx: Dict[str, np.ndarray] = {
+        str(cond): np.where(condition_ids == cond)[0] for cond in unique_conditions
+    }
+    sorted_conditions = sorted(
+        cond_to_idx.keys(),
+        key=lambda c: cond_to_idx[c].shape[0],
+        reverse=True,
+    )
+
+    if test_condition_id is None:
+        test_condition_id = sorted_conditions[0]
+    if test_condition_id not in cond_to_idx:
+        raise ValueError(f"test_condition_id 不存在: {test_condition_id}")
+
+    remaining = [c for c in sorted_conditions if c != test_condition_id]
+    val_condition_id = remaining[0] if len(remaining) > 0 else None
+    if val_condition_id is None:
+        raise ValueError("无法构建验证集工况，至少需要 2 个工况")
+
+    test_indices = cond_to_idx[test_condition_id]
+    val_indices = cond_to_idx[val_condition_id]
+
+    train_indices = []
+    for c in remaining[1:]:
+        train_indices.append(cond_to_idx[c])
+    if len(train_indices) == 0:
+        # 仅两个工况时，在剩余工况中随机切分 train/val
+        base = cond_to_idx[val_condition_id].copy()
+        rng = np.random.default_rng(seed=seed)
+        rng.shuffle(base)
+        n_train = int(base.shape[0] * (split_ratio[0] / (split_ratio[0] + split_ratio[1])))
+        train_indices = base[:n_train]
+        val_indices = base[n_train:]
+    else:
+        train_indices = np.concatenate(train_indices, axis=0)
+
+    return (
+        train_indices.astype(np.int64),
+        val_indices.astype(np.int64),
+        test_indices.astype(np.int64),
+    )
 
 
 def _filter_samples_by_fault_label(samples: list) -> list:
@@ -365,4 +530,3 @@ def get_sound_api_cache_dataloaders(
 
 
 __all__ = ["LieGroupDataset", "get_dataloaders", "get_sound_api_cache_dataloaders"]
-
