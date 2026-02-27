@@ -308,6 +308,7 @@ def evaluate_binary(
     criterion: nn.Module,
     dataloader: DataLoader,
     device: torch.device,
+    threshold: float = 0.5,
 ) -> Tuple[float, float, np.ndarray, np.ndarray, List]:
     """二分类评估（Risk）- 返回预测值和真实值用于计算 AUC"""
     backbone.eval()
@@ -337,7 +338,7 @@ def evaluate_binary(
 
         running_loss += loss.item() * x.size(0)
         probs = torch.sigmoid(logits)
-        preds = (probs > 0.5).float()
+        preds = (probs > threshold).float()
         correct += (preds == y).sum().item()
         total += x.size(0)
         
@@ -362,6 +363,25 @@ def evaluate_binary(
         pr_auc = 0.0
     
     return epoch_loss, epoch_acc, preds, targets, all_meta, auc, pr_auc
+
+
+def calibrate_binary_threshold(
+    targets: np.ndarray,
+    probs: np.ndarray,
+    default_threshold: float = 0.5,
+) -> float:
+    """在验证集上按 F1 最大化选择阈值。"""
+    try:
+        from sklearn.metrics import precision_recall_curve
+        p, r, thresholds = precision_recall_curve(targets, probs)
+        if thresholds is None or len(thresholds) == 0:
+            return default_threshold
+        f1 = (2 * p[:-1] * r[:-1]) / np.clip(p[:-1] + r[:-1], 1e-8, None)
+        best_idx = int(np.nanargmax(f1))
+        th = float(thresholds[best_idx])
+        return max(0.01, min(0.99, th))
+    except Exception:
+        return default_threshold
 
 
 def plot_hi_predictions(preds: np.ndarray, targets: np.ndarray, meta: List, output_dir: str):
@@ -522,18 +542,21 @@ def save_risk_predictions_csv(
     preds: np.ndarray,
     targets: np.ndarray,
     meta: List,
+    threshold: float = 0.5,
 ) -> None:
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["bearing_id", "t", "T", "target", "pred_prob", "npz_path"])
+        writer.writerow(["bearing_id", "t", "T", "target", "pred_prob", "pred_label", "npz_path"])
         for i in range(len(preds)):
             m = meta[i] if i < len(meta) else {}
+            p = float(preds[i])
             writer.writerow([
                 m.get("bearing_id", ""),
                 m.get("t", ""),
                 m.get("T", ""),
                 float(targets[i]),
-                float(preds[i]),
+                p,
+                int(p > threshold),
                 m.get("npz_path", ""),
             ])
 
@@ -625,6 +648,26 @@ def main():
         help='CWRU 切分方式: random 或 leave_one_condition_out'
     )
     parser.add_argument(
+        '--sound_split_mode',
+        type=str,
+        choices=['bearing', 'leave_one_condition_out'],
+        default='bearing',
+        help='sound_api_cache 切分方式: bearing 或 leave_one_condition_out'
+    )
+    parser.add_argument(
+        '--condition_map_path',
+        type=str,
+        default=None,
+        help='bearing_id->condition_id 映射文件(.csv/.json)，用于 leave_one_condition_out'
+    )
+    parser.add_argument(
+        '--condition_policy',
+        type=str,
+        choices=['xjtu_3cond', 'none'],
+        default='xjtu_3cond',
+        help='未提供 condition_map 时的工况推断策略'
+    )
+    parser.add_argument(
         '--base_dir',
         type=str,
         default='cwru_processed',
@@ -665,6 +708,17 @@ def main():
         type=int,
         default=None,
         help='风险预测的时间窗口（仅用于 risk 任务）'
+    )
+    parser.add_argument(
+        '--risk_threshold',
+        type=float,
+        default=0.5,
+        help='风险预测阈值（默认 0.5）'
+    )
+    parser.add_argument(
+        '--calibrate_threshold',
+        action='store_true',
+        help='在验证集自动校准风险阈值（F1 最优）'
     )
     # sound_api_cache 相关参数
     parser.add_argument(
@@ -888,6 +942,10 @@ def main():
             split_ratio=split_ratio,
             cache_dir=args.cache_dir,
             index_path=args.index_path,
+            split_mode=args.sound_split_mode,
+            condition_map_path=args.condition_map_path,
+            condition_policy=args.condition_policy,
+            test_condition_id=args.test_condition_id,
             task=args.task,
             horizon=args.horizon,
             num_workers=workers,
@@ -942,7 +1000,9 @@ def main():
         if args.data_source == 'sound_api_cache':
             eval_fn = evaluate_binary
         else:
-            eval_fn = lambda b, h, c, d, dev: (0.0, 0.0, np.array([]), np.array([]), [], 0.0, 0.0)
+            eval_fn = lambda b, h, c, d, dev, threshold=0.5: (
+                0.0, 0.0, np.array([]), np.array([]), [], 0.0, 0.0
+            )
     else:  # arcface
         # 推断 num_classes
         all_labels = []
@@ -983,6 +1043,7 @@ def main():
         )
 
     best_val_metric = float('inf') if args.task in ['hi', 'risk'] else 0.0
+    best_risk_threshold = float(args.risk_threshold)
     no_improve_epochs = 0
     os.makedirs(ckpt_out_dir, exist_ok=True)
     os.makedirs(plots_dir, exist_ok=True)
@@ -1000,6 +1061,14 @@ def main():
         head.load_state_dict(torch.load(head_path, map_location="cpu", weights_only=True))
         backbone.to(device)
         head.to(device)
+        if args.task == "risk":
+            th_path = ckpt_dir.parent / "outputs" / "risk_threshold.txt"
+            if th_path.exists():
+                try:
+                    best_risk_threshold = float(th_path.read_text(encoding="utf-8").strip())
+                    print(f"从归档读取风险阈值: {best_risk_threshold:.4f}")
+                except ValueError:
+                    print(f"风险阈值文件解析失败，继续使用 --risk_threshold={best_risk_threshold:.4f}")
         # 快速验证：仅用测试集前 N 个样本，fast_eval 时用大 batch 减少迭代
         if getattr(args, "max_test_samples", None) and args.max_test_samples > 0:
             from torch.utils.data import Subset
@@ -1026,8 +1095,9 @@ def main():
             if not (getattr(args, "max_test_samples", None) and args.max_test_samples > 0):
                 plot_hi_predictions(test_preds, test_targets, test_meta, str(plots_dir))
         elif args.task == 'risk':
+            print(f"使用风险阈值: {best_risk_threshold:.4f}")
             test_loss, test_acc, test_preds, test_targets, test_meta, test_auc, test_pr_auc = eval_fn(
-                backbone, head, criterion, test_loader, device
+                backbone, head, criterion, test_loader, device, threshold=best_risk_threshold
             )
             print(
                 f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f} | "
@@ -1035,7 +1105,9 @@ def main():
             )
             if not (getattr(args, "max_test_samples", None) and args.max_test_samples > 0):
                 plot_risk_predictions(test_preds, test_targets, test_meta, str(plots_dir))
-                save_risk_predictions_csv(risk_pred_path, test_preds, test_targets, test_meta)
+                save_risk_predictions_csv(
+                    risk_pred_path, test_preds, test_targets, test_meta, threshold=best_risk_threshold
+                )
         else:
             test_loss, test_acc = eval_fn(backbone, head, criterion, test_loader, device)
             print(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f}")
@@ -1073,7 +1145,7 @@ def main():
             metric_name = "MAE"
         elif args.task == 'risk':
             val_loss, val_acc, val_preds, val_targets, val_meta, val_auc, val_pr_auc = eval_fn(
-                backbone, head, criterion, val_loader, device
+                backbone, head, criterion, val_loader, device, threshold=best_risk_threshold
             )
             print(
                 f"Train Loss: {train_loss:.4f} | Train Acc: {train_metric:.4f} | "
@@ -1107,12 +1179,27 @@ def main():
                 improved = True
         
         if is_best:
+            if args.task == "risk" and args.calibrate_threshold and val_preds.size > 0:
+                best_risk_threshold = calibrate_binary_threshold(
+                    targets=val_targets,
+                    probs=val_preds,
+                    default_threshold=float(args.risk_threshold),
+                )
+                print(f"  -> Calibrated risk threshold: {best_risk_threshold:.4f}")
             torch.save(backbone.state_dict(), ckpt_out_dir / "backbone.pth")
             if args.task == 'arcface':
                 torch.save(head.state_dict(), ckpt_out_dir / "arcface_head.pth")
             else:
                 torch.save(head.state_dict(), ckpt_out_dir / f"{args.task}_head.pth")
-            print(f"  -> New best model saved (Val {metric_name}: {best_val_metric:.4f})")
+            if args.task == "risk":
+                best_display_metric = 1.0 - best_val_metric
+            else:
+                best_display_metric = best_val_metric
+            print(f"  -> New best model saved (Val {metric_name}: {best_display_metric:.4f})")
+            if args.task == "risk":
+                (outputs_dir / "risk_threshold.txt").write_text(
+                    f"{best_risk_threshold:.6f}\n", encoding="utf-8"
+                )
 
         # 学习率调度（plateau 用验证损失，其余按 epoch）
         if scheduler is not None:
@@ -1167,8 +1254,9 @@ def main():
         })
     
     elif args.task == 'risk':
+        print(f"最终风险阈值: {best_risk_threshold:.4f}")
         test_loss, test_acc, test_preds, test_targets, test_meta, test_auc, test_pr_auc = eval_fn(
-            backbone, head, criterion, test_loader, device
+            backbone, head, criterion, test_loader, device, threshold=best_risk_threshold
         )
         print(
             f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f} | "
@@ -1177,7 +1265,9 @@ def main():
         
         # 绘图
         plot_risk_predictions(test_preds, test_targets, test_meta, str(plots_dir))
-        save_risk_predictions_csv(risk_pred_path, test_preds, test_targets, test_meta)
+        save_risk_predictions_csv(
+            risk_pred_path, test_preds, test_targets, test_meta, threshold=best_risk_threshold
+        )
         
         # 保存指标
         save_metrics_csv(metrics_path, {

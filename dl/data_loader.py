@@ -1,5 +1,7 @@
 import os
 import csv
+import json
+import re
 from typing import Tuple, Optional, Dict, List
 
 import numpy as np
@@ -361,6 +363,10 @@ def get_sound_api_cache_dataloaders(
     split_ratio: Tuple[float, float, float] = (0.7, 0.15, 0.15),
     cache_dir: str = "datasets/sound_api/cache_npz",
     index_path: Optional[str] = None,
+    split_mode: str = "bearing",
+    condition_map_path: Optional[str] = None,
+    condition_policy: str = "xjtu_3cond",
+    test_condition_id: Optional[str] = None,
     task: str = 'hi',
     horizon: Optional[int] = None,
     num_workers: int = 0,
@@ -425,12 +431,28 @@ def get_sound_api_cache_dataloaders(
             )
         print(f"  保留有标签样本: {len(samples)} 个")
     
-    # bearing-level split（打印分配概况）
-    train_samples, val_samples, test_samples = split_by_bearing(
-        samples, split_ratio=split_ratio, seed=seed, verbose=True
-    )
+    # bearing-level split / leave-one-condition-out
+    if split_mode == "leave_one_condition_out":
+        cond_map = _load_condition_map(condition_map_path) if condition_map_path else {}
+        for s in samples:
+            s["condition_id"] = _resolve_sound_condition_id(
+                sample=s,
+                condition_map=cond_map,
+                condition_policy=condition_policy,
+            )
+        train_samples, val_samples, test_samples = _split_sound_samples_by_condition(
+            samples=samples,
+            test_condition_id=test_condition_id,
+            split_ratio=split_ratio,
+            seed=seed,
+        )
+    else:
+        train_samples, val_samples, test_samples = split_by_bearing(
+            samples, split_ratio=split_ratio, seed=seed, verbose=True
+        )
     
-    print(f"数据集划分 (bearing-level):")
+    split_tag = "condition-level" if split_mode == "leave_one_condition_out" else "bearing-level"
+    print(f"数据集划分 ({split_tag}):")
     print(f"  训练集: {len(train_samples)} 样本 ({len(set(s['bearing_id'] for s in train_samples))} bearings)")
     print(f"  验证集: {len(val_samples)} 样本 ({len(set(s['bearing_id'] for s in val_samples))} bearings)")
     print(f"  测试集: {len(test_samples)} 样本 ({len(set(s['bearing_id'] for s in test_samples))} bearings)")
@@ -527,6 +549,113 @@ def get_sound_api_cache_dataloaders(
     )
     
     return train_loader, val_loader, test_loader
+
+
+def _load_condition_map(path: str) -> Dict[str, str]:
+    """加载 bearing_id -> condition_id 映射，支持 .json / .csv。"""
+    map_path = os.path.abspath(path)
+    if not os.path.exists(map_path):
+        raise FileNotFoundError(f"condition_map 文件不存在: {map_path}")
+    mapping: Dict[str, str] = {}
+    if map_path.lower().endswith(".json"):
+        with open(map_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            mapping = {str(k): str(v) for k, v in data.items()}
+        elif isinstance(data, list):
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                if "bearing_id" in row and "condition_id" in row:
+                    mapping[str(row["bearing_id"])] = str(row["condition_id"])
+    else:
+        with open(map_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if "bearing_id" in row and "condition_id" in row:
+                    mapping[str(row["bearing_id"])] = str(row["condition_id"])
+    if len(mapping) == 0:
+        raise ValueError(f"condition_map 为空或格式不正确: {map_path}")
+    return mapping
+
+
+def _infer_xjtu_condition_from_bearing_id(bearing_id: str) -> str:
+    """
+    XJTU 工况推断（默认策略）：
+    每 5 个 bearing 为一个条件组，按 3 组循环映射到 cond_1/2/3。
+    """
+    m = re.search(r"\d+", str(bearing_id))
+    if not m:
+        return "unknown"
+    bid = int(m.group(0))
+    cond_idx = ((bid - 1) // 5) % 3 + 1
+    return f"cond_{cond_idx}"
+
+
+def _resolve_sound_condition_id(
+    sample: Dict,
+    condition_map: Dict[str, str],
+    condition_policy: str = "xjtu_3cond",
+) -> str:
+    bid = str(sample.get("bearing_id", ""))
+    if bid in condition_map:
+        return condition_map[bid]
+    if condition_policy == "xjtu_3cond":
+        return _infer_xjtu_condition_from_bearing_id(bid)
+    return "unknown"
+
+
+def _split_sound_samples_by_condition(
+    samples: List[Dict],
+    test_condition_id: Optional[str],
+    split_ratio: Tuple[float, float, float],
+    seed: int = 42,
+) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+    """按 condition_id 切分：留一条件测试，留一条件验证，其余训练。"""
+    cond_groups: Dict[str, List[Dict]] = {}
+    for s in samples:
+        cid = str(s.get("condition_id", "unknown"))
+        cond_groups.setdefault(cid, []).append(s)
+
+    condition_ids = sorted(cond_groups.keys())
+    if len(condition_ids) < 2:
+        raise ValueError("leave_one_condition_out 至少需要 2 个 condition_id")
+
+    if test_condition_id is None:
+        # 默认选择样本数最多的 condition 作为测试集
+        test_condition_id = sorted(condition_ids, key=lambda c: len(cond_groups[c]), reverse=True)[0]
+    if test_condition_id not in cond_groups:
+        raise ValueError(f"test_condition_id 不存在: {test_condition_id}")
+
+    remaining = [c for c in condition_ids if c != test_condition_id]
+    val_condition_id = remaining[0]
+
+    train_samples: List[Dict] = []
+    for cid in remaining[1:]:
+        train_samples.extend(cond_groups[cid])
+    val_samples = list(cond_groups[val_condition_id])
+    test_samples = list(cond_groups[test_condition_id])
+
+    if len(train_samples) == 0:
+        # 只有两个工况时，在验证工况内部按比例拆一部分给 train
+        rng = np.random.default_rng(seed=seed)
+        idx = np.arange(len(val_samples))
+        rng.shuffle(idx)
+        train_ratio = split_ratio[0] / max(1e-8, (split_ratio[0] + split_ratio[1]))
+        n_train = int(len(val_samples) * train_ratio)
+        train_idx = set(idx[:n_train].tolist())
+        new_train, new_val = [], []
+        for i, s in enumerate(val_samples):
+            (new_train if i in train_idx else new_val).append(s)
+        train_samples, val_samples = new_train, new_val
+
+    print("\n" + "=" * 80)
+    print("数据集划分概况 (Leave-One-Condition-Out)")
+    print("=" * 80)
+    print(f"测试工况: {test_condition_id}, 验证工况: {val_condition_id}")
+    print(f"训练集: {len(train_samples)} | 验证集: {len(val_samples)} | 测试集: {len(test_samples)}")
+    print("=" * 80)
+    return train_samples, val_samples, test_samples
 
 
 __all__ = ["LieGroupDataset", "get_dataloaders", "get_sound_api_cache_dataloaders"]
