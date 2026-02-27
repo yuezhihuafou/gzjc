@@ -414,9 +414,9 @@ def get_sound_api_cache_dataloaders(
     
     print(f"找到 {len(samples)} 个样本")
     
-    # task=='cls' 时用思路 B 从 NPZ→JSON→.f→sidecar 无损还原标签，再过滤
-    if task == 'cls':
-        print("cls 任务：通过 NPZ→JSON→.f→sidecar 反推补回标签（思路 B）...")
+    # task in {'risk','cls'} 时强制真实标签：从 NPZ→JSON→.f→sidecar 反推补回，再过滤缺失标签
+    if task in ('risk', 'cls'):
+        print(f"{task} 任务：强制使用真实标签（NPZ→JSON→.f→sidecar）...")
         for s in samples:
             s['fault_label'] = resolve_fault_label_from_f_source(s['npz_path'])
         n_before = len(samples)
@@ -426,10 +426,13 @@ def get_sound_api_cache_dataloaders(
             print(f"  已排除无法从 .f sidecar 解析标签的样本: {dropped} 个")
         if len(samples) == 0:
             raise ValueError(
-                "无有效分类标签。请确认 NPZ 由 build_sound_api_cache 从 convert_mc_to_api_json 的 JSON 构建，"
+                "无有效真实标签。请确认 NPZ 由 build_sound_api_cache 从 convert_mc_to_api_json 的 JSON 构建，"
                 "且 .f 侧有 sidecar .json 含 health_label/fault_label。"
             )
+        n_fault = sum(1 for s in samples if int(s['fault_label']) > 0)
+        n_normal = len(samples) - n_fault
         print(f"  保留有标签样本: {len(samples)} 个")
+        print(f"  标签分布: normal={n_normal}, fault={n_fault}")
     
     # bearing-level split / leave-one-condition-out
     if split_mode == "leave_one_condition_out":

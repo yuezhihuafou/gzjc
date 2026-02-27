@@ -828,9 +828,9 @@ def main():
         if not args.max_test_samples or args.max_test_samples > 64:
             args.max_test_samples = 64
     
-    # 验证参数
+    # 参数提示：risk 任务现使用真实 fault_label，不再强制依赖 horizon
     if args.task == 'risk' and args.horizon is None:
-        raise ValueError("risk 任务需要指定 --horizon 参数")
+        print("提示: risk 任务当前使用真实标签（fault_label），未提供 --horizon 也可训练。")
     
     # sound_api_cache + arcface 已支持（NPZ 中还原 fault_label 后过滤无标签样本）
     # 根据数据源设置默认 batch_size

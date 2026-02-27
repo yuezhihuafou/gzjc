@@ -3,7 +3,7 @@ Sound API Cache Dataset - 从 NPZ 缓存加载数据（只读 NPZ）
 
 支持任务：
 - hi: 健康指数回归，y_hi = 1 - t/(T-1)
-- risk: 风险预测二分类，给定 horizon=K，tf=floor(0.3*T)，y=1 if t+K>=tf else 0
+- risk: 真实故障二分类，使用 fault_label 二值化（fault_label>0 为 1）
 - cls: 分类任务，标签可从 NPZ 或通过思路 B（NPZ→JSON→.f→sidecar）无损还原
 
 注意：
@@ -110,10 +110,6 @@ class SoundAPICacheDataset(Dataset):
         else:
             self.channel_std = None
         
-        # 验证任务参数
-        if task == 'risk' and horizon is None:
-            raise ValueError("risk 任务需要指定 horizon 参数")
-    
     def __len__(self) -> int:
         return len(self.samples)
     
@@ -132,8 +128,8 @@ class SoundAPICacheDataset(Dataset):
         except (EOFError, OSError, ValueError) as e:
             raise RuntimeError(f"NPZ 损坏或未完整上传，无法加载: {npz_path}") from e
         
-        # 分类标签：优先用思路 B 在 data_loader 中已解析的 sample['fault_label']，否则用 NPZ
-        if self.task == 'cls':
+        # 标签读取：优先使用 data_loader 中解析后的 sample['fault_label']，否则用 NPZ
+        if self.task in ('cls', 'risk'):
             fault_label = sample.get('fault_label', fault_label_npz)
             if fault_label == -1 and fault_label_npz >= 0:
                 fault_label = fault_label_npz
@@ -158,9 +154,10 @@ class SoundAPICacheDataset(Dataset):
             y = np.float32(y)
         
         elif self.task == 'risk':
-            # 风险预测：给定 horizon=K，tf=floor(0.3*T)，y=1 if t+K>=tf else 0
-            tf = int(np.floor(0.3 * T))
-            y = 1.0 if (t + self.horizon >= tf) else 0.0
+            # 真实故障检测：fault_label 二值化（0=正常，>0=故障）
+            if fault_label < 0:
+                raise ValueError(f"risk 任务需要真实标签 fault_label，当前样本缺失: {npz_path}")
+            y = 1.0 if int(fault_label) > 0 else 0.0
             y = np.float32(y)
         
         elif self.task == 'cls':
