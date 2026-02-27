@@ -17,6 +17,7 @@ import sys
 import argparse
 import csv
 import json
+from datetime import datetime
 from typing import Tuple, Dict, List, Optional
 from pathlib import Path
 
@@ -481,6 +482,62 @@ def dump_split_files_for_cwru(
     print(f"切分文件已导出: {output_dir}")
 
 
+def _safe_name(text: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text)
+
+
+def build_run_name(args: argparse.Namespace) -> str:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    parts = [ts, args.data_source, args.task]
+    if args.task == "risk" and args.horizon is not None:
+        parts.append(f"h{args.horizon}")
+    if args.data_source == "sound_api_cache":
+        idx_tag = "full"
+        if args.index_path:
+            idx_tag = "small" if "small" in Path(args.index_path).name.lower() else "custom"
+        parts.append(f"idx_{idx_tag}")
+    return _safe_name("_".join(parts))
+
+
+def save_run_config(run_dir: Path, args: argparse.Namespace, device: torch.device) -> None:
+    cfg = vars(args).copy()
+    cfg["resolved_device"] = str(device)
+    cfg["created_at"] = datetime.now().isoformat()
+    (run_dir / "config.json").write_text(
+        json.dumps(cfg, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def save_metrics_csv(metrics_path: Path, metrics: Dict[str, float]) -> None:
+    with open(metrics_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["metric", "value"])
+        for k, v in metrics.items():
+            writer.writerow([k, v])
+
+
+def save_risk_predictions_csv(
+    csv_path: Path,
+    preds: np.ndarray,
+    targets: np.ndarray,
+    meta: List,
+) -> None:
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["bearing_id", "t", "T", "target", "pred_prob", "npz_path"])
+        for i in range(len(preds)):
+            m = meta[i] if i < len(meta) else {}
+            writer.writerow([
+                m.get("bearing_id", ""),
+                m.get("t", ""),
+                m.get("T", ""),
+                float(targets[i]),
+                float(preds[i]),
+                m.get("npz_path", ""),
+            ])
+
+
 def main():
     parser = argparse.ArgumentParser(description='训练模型')
     parser.add_argument(
@@ -649,6 +706,23 @@ def main():
         action='store_true',
         help='使用混合精度 (FP16) 训练，加速并省显存（仅 CUDA）'
     )
+    parser.add_argument(
+        '--runs_root',
+        type=str,
+        default='experiments/runs',
+        help='实验自动归档根目录'
+    )
+    parser.add_argument(
+        '--run_name',
+        type=str,
+        default=None,
+        help='实验归档目录名（默认自动生成）'
+    )
+    parser.add_argument(
+        '--no_archive',
+        action='store_true',
+        help='关闭自动归档（不建议）'
+    )
     
     args = parser.parse_args()
 
@@ -726,6 +800,28 @@ def main():
         mode = "仅评估" if args.eval_only and not args.allow_cwru_train else "训练/评估"
         print(f"运行模式: CWRU {mode}")
 
+    # 自动归档目录（每次实验独立保存）
+    if args.no_archive:
+        run_dir = Path(".")
+        ckpt_out_dir = Path("checkpoints")
+        outputs_dir = Path("experiments/outputs")
+        plots_dir = outputs_dir / "plots"
+        metrics_path = outputs_dir / "metrics.csv"
+        risk_pred_path = outputs_dir / "risk_predictions.csv"
+    else:
+        run_name = args.run_name or build_run_name(args)
+        run_dir = Path(args.runs_root) / run_name
+        ckpt_out_dir = run_dir / "checkpoints"
+        outputs_dir = run_dir / "outputs"
+        plots_dir = outputs_dir / "plots"
+        metrics_path = outputs_dir / "metrics.csv"
+        risk_pred_path = outputs_dir / "risk_predictions.csv"
+        ckpt_out_dir.mkdir(parents=True, exist_ok=True)
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "outputs" / "splits").mkdir(parents=True, exist_ok=True)
+        save_run_config(run_dir, args, device)
+        print(f"实验归档目录: {run_dir}")
+
     # 数据加载
     workers = getattr(args, 'workers', 0)
     if args.data_source == 'sound':
@@ -760,6 +856,9 @@ def main():
         )
     else:
         print("\n加载 CWRU 处理后的数据...")
+        split_dump_dir = args.split_dump_dir
+        if not args.no_archive and split_dump_dir == 'experiments/outputs/splits':
+            split_dump_dir = str(run_dir / "outputs" / "splits")
         train_loader, val_loader, test_loader = get_dataloaders(
             batch_size=batch_size,
             split_ratio=split_ratio,
@@ -775,7 +874,7 @@ def main():
             train_loader=train_loader,
             val_loader=val_loader,
             test_loader=test_loader,
-            split_dump_dir=args.split_dump_dir,
+            split_dump_dir=split_dump_dir,
         )
 
     # 模型初始化（DirectML 对部分 1D 算子支持有限，失败则回退 CPU）
@@ -828,8 +927,8 @@ def main():
     )
 
     best_val_metric = float('inf') if args.task in ['hi', 'risk'] else 0.0
-    os.makedirs("checkpoints", exist_ok=True)
-    os.makedirs("experiments/outputs/plots", exist_ok=True)
+    os.makedirs(ckpt_out_dir, exist_ok=True)
+    os.makedirs(plots_dir, exist_ok=True)
 
     # 仅评估：加载 checkpoint，仅在测试集上评估后退出
     if args.eval_only:
@@ -868,7 +967,7 @@ def main():
             test_rmse = np.sqrt(np.mean((test_preds - test_targets) ** 2))
             print(f"Test Loss: {test_loss:.4f} | Test MAE: {test_mae:.4f} | Test RMSE: {test_rmse:.4f}")
             if not (getattr(args, "max_test_samples", None) and args.max_test_samples > 0):
-                plot_hi_predictions(test_preds, test_targets, test_meta, "experiments/outputs/plots")
+                plot_hi_predictions(test_preds, test_targets, test_meta, str(plots_dir))
         elif args.task == 'risk':
             test_loss, test_acc, test_preds, test_targets, test_meta, test_auc, test_pr_auc = eval_fn(
                 backbone, head, criterion, test_loader, device
@@ -878,7 +977,8 @@ def main():
                 f"Test AUC: {test_auc:.4f} | Test PR-AUC: {test_pr_auc:.4f}"
             )
             if not (getattr(args, "max_test_samples", None) and args.max_test_samples > 0):
-                plot_risk_predictions(test_preds, test_targets, test_meta, "experiments/outputs/plots")
+                plot_risk_predictions(test_preds, test_targets, test_meta, str(plots_dir))
+                save_risk_predictions_csv(risk_pred_path, test_preds, test_targets, test_meta)
         else:
             test_loss, test_acc = eval_fn(backbone, head, criterion, test_loader, device)
             print(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f}")
@@ -941,11 +1041,11 @@ def main():
                 is_best = True
         
         if is_best:
-            torch.save(backbone.state_dict(), os.path.join("checkpoints", "backbone.pth"))
+            torch.save(backbone.state_dict(), ckpt_out_dir / "backbone.pth")
             if args.task == 'arcface':
-                torch.save(head.state_dict(), os.path.join("checkpoints", "arcface_head.pth"))
+                torch.save(head.state_dict(), ckpt_out_dir / "arcface_head.pth")
             else:
-                torch.save(head.state_dict(), os.path.join("checkpoints", f"{args.task}_head.pth"))
+                torch.save(head.state_dict(), ckpt_out_dir / f"{args.task}_head.pth")
             print(f"  -> New best model saved (Val {metric_name}: {best_val_metric:.4f})")
 
     # 测试集评估
@@ -961,15 +1061,14 @@ def main():
         print(f"Test Loss: {test_loss:.4f} | Test MAE: {test_mae:.4f} | Test RMSE: {test_rmse:.4f}")
         
         # 绘图
-        plot_hi_predictions(test_preds, test_targets, test_meta, "experiments/outputs/plots")
+        plot_hi_predictions(test_preds, test_targets, test_meta, str(plots_dir))
         
         # 保存指标
-        with open("experiments/outputs/metrics.csv", 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['metric', 'value'])
-            writer.writerow(['test_loss', test_loss])
-            writer.writerow(['test_mae', test_mae])
-            writer.writerow(['test_rmse', test_rmse])
+        save_metrics_csv(metrics_path, {
+            "test_loss": test_loss,
+            "test_mae": test_mae,
+            "test_rmse": test_rmse,
+        })
     
     elif args.task == 'risk':
         test_loss, test_acc, test_preds, test_targets, test_meta, test_auc, test_pr_auc = eval_fn(
@@ -981,22 +1080,26 @@ def main():
         )
         
         # 绘图
-        plot_risk_predictions(test_preds, test_targets, test_meta, "experiments/outputs/plots")
+        plot_risk_predictions(test_preds, test_targets, test_meta, str(plots_dir))
+        save_risk_predictions_csv(risk_pred_path, test_preds, test_targets, test_meta)
         
         # 保存指标
-        with open("experiments/outputs/metrics.csv", 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(['metric', 'value'])
-            writer.writerow(['test_loss', test_loss])
-            writer.writerow(['test_acc', test_acc])
-            writer.writerow(['test_auc', test_auc])
-            writer.writerow(['test_pr_auc', test_pr_auc])
+        save_metrics_csv(metrics_path, {
+            "test_loss": test_loss,
+            "test_acc": test_acc,
+            "test_auc": test_auc,
+            "test_pr_auc": test_pr_auc,
+        })
     
     else:  # arcface
         test_loss, test_acc = eval_fn(
             backbone, head, criterion, test_loader, device
         )
         print(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f}")
+        save_metrics_csv(metrics_path, {
+            "test_loss": test_loss,
+            "test_acc": test_acc,
+        })
         # 输出类别 id 与可读名对应
         n_cls = getattr(head, "out_features", None)
         if n_cls is not None:
