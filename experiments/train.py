@@ -573,6 +573,44 @@ def main():
         help='学习率'
     )
     parser.add_argument(
+        '--optimizer',
+        type=str,
+        choices=['adam', 'adamw'],
+        default='adamw',
+        help='优化器类型（默认 adamw）'
+    )
+    parser.add_argument(
+        '--weight_decay',
+        type=float,
+        default=1e-4,
+        help='权重衰减系数'
+    )
+    parser.add_argument(
+        '--scheduler',
+        type=str,
+        choices=['none', 'cosine', 'plateau'],
+        default='cosine',
+        help='学习率调度器（默认 cosine）'
+    )
+    parser.add_argument(
+        '--min_lr',
+        type=float,
+        default=1e-6,
+        help='调度器最小学习率'
+    )
+    parser.add_argument(
+        '--early_stop_patience',
+        type=int,
+        default=10,
+        help='早停耐心轮数（<=0 关闭）'
+    )
+    parser.add_argument(
+        '--early_stop_min_delta',
+        type=float,
+        default=1e-4,
+        help='早停最小提升阈值'
+    )
+    parser.add_argument(
         '--split_ratio',
         type=float,
         nargs=3,
@@ -920,13 +958,32 @@ def main():
         train_fn = train_one_epoch_arcface
         eval_fn = evaluate_arcface
 
-    optimizer = torch.optim.Adam(
-        list(backbone.parameters()) + list(head.parameters()),
-        lr=lr,
-        weight_decay=1e-4,
-    )
+    param_groups = list(backbone.parameters()) + list(head.parameters())
+    if args.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            lr=lr,
+            weight_decay=args.weight_decay,
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            param_groups,
+            lr=lr,
+            weight_decay=args.weight_decay,
+        )
+
+    scheduler = None
+    if args.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(1, epochs), eta_min=args.min_lr
+        )
+    elif args.scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=3, min_lr=args.min_lr
+        )
 
     best_val_metric = float('inf') if args.task in ['hi', 'risk'] else 0.0
+    no_improve_epochs = 0
     os.makedirs(ckpt_out_dir, exist_ok=True)
     os.makedirs(plots_dir, exist_ok=True)
 
@@ -989,6 +1046,12 @@ def main():
     scaler = torch.amp.GradScaler() if use_amp else None
     if use_amp:
         print("使用混合精度 (AMP) 训练")
+    print(f"优化器: {args.optimizer}, weight_decay={args.weight_decay}")
+    print(f"调度器: {args.scheduler}, min_lr={args.min_lr}")
+    if args.early_stop_patience > 0:
+        print(
+            f"早停: patience={args.early_stop_patience}, min_delta={args.early_stop_min_delta}"
+        )
 
     # 训练循环
     for epoch in range(1, epochs + 1):
@@ -1031,14 +1094,17 @@ def main():
 
         # 保存最优模型
         is_best = False
+        improved = False
         if args.task in ['hi', 'risk']:
-            if val_metric < best_val_metric:
+            if val_metric < (best_val_metric - args.early_stop_min_delta):
                 best_val_metric = val_metric
                 is_best = True
+                improved = True
         else:
-            if val_metric > best_val_metric:
+            if val_metric > (best_val_metric + args.early_stop_min_delta):
                 best_val_metric = val_metric
                 is_best = True
+                improved = True
         
         if is_best:
             torch.save(backbone.state_dict(), ckpt_out_dir / "backbone.pth")
@@ -1047,6 +1113,36 @@ def main():
             else:
                 torch.save(head.state_dict(), ckpt_out_dir / f"{args.task}_head.pth")
             print(f"  -> New best model saved (Val {metric_name}: {best_val_metric:.4f})")
+
+        # 学习率调度（plateau 用验证损失，其余按 epoch）
+        if scheduler is not None:
+            if args.scheduler == "plateau":
+                scheduler.step(val_loss)
+            else:
+                scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"  -> LR: {current_lr:.6e}")
+
+        # 早停
+        if improved:
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+            if args.early_stop_patience > 0 and no_improve_epochs >= args.early_stop_patience:
+                print(
+                    f"触发早停: 连续 {no_improve_epochs} 个 epoch 无显著提升，停止训练。"
+                )
+                break
+
+    # 统一用最佳 checkpoint 做最终测试，避免最后一轮回退
+    best_backbone = ckpt_out_dir / "backbone.pth"
+    best_head = ckpt_out_dir / ("arcface_head.pth" if args.task == "arcface" else f"{args.task}_head.pth")
+    if best_backbone.exists() and best_head.exists():
+        backbone.load_state_dict(torch.load(best_backbone, map_location="cpu", weights_only=True))
+        head.load_state_dict(torch.load(best_head, map_location="cpu", weights_only=True))
+        backbone.to(device)
+        head.to(device)
+        print("已加载最佳 checkpoint 进行最终测试。")
 
     # 测试集评估
     print("\n" + "=" * 80)
