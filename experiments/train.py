@@ -502,6 +502,38 @@ def dump_split_files_for_cwru(
     print(f"切分文件已导出: {output_dir}")
 
 
+def dump_split_files_for_sound_cache(
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    test_loader: DataLoader,
+    split_dump_dir: str,
+) -> None:
+    """导出 sound_api_cache 的样本切分文件（含标签与路径），便于复现实验。"""
+    output_dir = Path(split_dump_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _dump_samples(name: str, dataset) -> None:
+        csv_path = output_dir / f"{name}_samples.csv"
+        samples = getattr(dataset, "samples", [])
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["bearing_id", "t", "T", "fault_label", "condition_id", "npz_path"])
+            for s in samples:
+                writer.writerow([
+                    s.get("bearing_id", ""),
+                    s.get("t", ""),
+                    s.get("T", ""),
+                    s.get("fault_label", ""),
+                    s.get("condition_id", ""),
+                    s.get("npz_path", ""),
+                ])
+
+    _dump_samples("train", train_loader.dataset)
+    _dump_samples("val", val_loader.dataset)
+    _dump_samples("test", test_loader.dataset)
+    print(f"sound_api_cache 切分文件已导出: {output_dir}")
+
+
 def _safe_name(text: str) -> str:
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in text)
 
@@ -799,6 +831,19 @@ def main():
         help='使用混合精度 (FP16) 训练，加速并省显存（仅 CUDA）'
     )
     parser.add_argument(
+        '--model_scale',
+        type=str,
+        choices=['base', 'large'],
+        default='base',
+        help='模型规模：base(默认) 或 large(扩容版)'
+    )
+    parser.add_argument(
+        '--embedding_dim',
+        type=int,
+        default=None,
+        help='embedding 维度（默认: base=512, large=768）'
+    )
+    parser.add_argument(
         '--runs_root',
         type=str,
         default='experiments/runs',
@@ -842,6 +887,7 @@ def main():
     epochs = args.epochs
     lr = args.lr
     split_ratio = tuple(args.split_ratio)
+    embedding_dim = args.embedding_dim if args.embedding_dim else (768 if args.model_scale == "large" else 512)
 
     if args.device is not None:
         if args.device not in ('cuda', 'cpu', 'xpu', 'dml'):
@@ -886,6 +932,7 @@ def main():
     print(f"数据源: {args.data_source}")
     print(f"任务: {args.task}")
     print(f"批大小: {batch_size}, 训练轮数: {epochs}, 学习率: {lr}")
+    print(f"模型规模: {args.model_scale}, embedding_dim: {embedding_dim}")
     if args.data_source == "sound_api_cache":
         print("运行模式: XJTU 优先主线（sound_api_cache）")
     elif args.data_source == "cwru":
@@ -950,6 +997,15 @@ def main():
             horizon=args.horizon,
             num_workers=workers,
         )
+        split_dump_dir = args.split_dump_dir
+        if not args.no_archive and split_dump_dir == 'experiments/outputs/splits':
+            split_dump_dir = str(run_dir / "outputs" / "splits")
+        dump_split_files_for_sound_cache(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            split_dump_dir=split_dump_dir,
+        )
     else:
         print("\n加载 CWRU 处理后的数据...")
         split_dump_dir = args.split_dump_dir
@@ -974,7 +1030,11 @@ def main():
         )
 
     # 模型初始化（DirectML 对部分 1D 算子支持有限，失败则回退 CPU）
-    backbone = build_backbone(in_channels=2, embedding_dim=512)
+    backbone = build_backbone(
+        in_channels=2,
+        embedding_dim=embedding_dim,
+        model_scale=args.model_scale,
+    )
     try:
         backbone = backbone.to(device)
     except RuntimeError:
@@ -986,7 +1046,7 @@ def main():
             raise
 
     if args.task == 'hi':
-        head = RegressionHead(in_features=512).to(device)
+        head = RegressionHead(in_features=embedding_dim).to(device)
         criterion = nn.MSELoss()
         train_fn = train_one_epoch_regression
         if args.data_source == 'sound_api_cache':
@@ -994,7 +1054,7 @@ def main():
         else:
             eval_fn = lambda b, h, c, d, dev: (0.0, 0.0)  # 占位
     elif args.task == 'risk':
-        head = BinaryClassificationHead(in_features=512).to(device)
+        head = BinaryClassificationHead(in_features=embedding_dim).to(device)
         criterion = nn.BCEWithLogitsLoss()
         train_fn = train_one_epoch_binary
         if args.data_source == 'sound_api_cache':
@@ -1013,7 +1073,7 @@ def main():
         if num_classes < 2:
             raise ValueError(f"ArcFace 任务需要至少 2 个类别，当前只有 {num_classes} 个")
         
-        head = ArcMarginProduct(in_features=512, out_features=num_classes, s=30.0, m=0.5).to(device)
+        head = ArcMarginProduct(in_features=embedding_dim, out_features=num_classes, s=30.0, m=0.5).to(device)
         criterion = nn.CrossEntropyLoss()
         train_fn = train_one_epoch_arcface
         eval_fn = evaluate_arcface
@@ -1291,6 +1351,23 @@ def main():
         if n_cls is not None:
             names = [CLASS_ID_TO_NAME.get(i, str(i)) for i in range(n_cls)]
             print(f"类别映射: {', '.join(f'{i}={names[i]}' for i in range(n_cls))}")
+
+    # 归档完整性检查：确保关键产物存在
+    if not args.no_archive:
+        required_paths = [
+            ckpt_out_dir / "backbone.pth",
+            ckpt_out_dir / ("arcface_head.pth" if args.task == "arcface" else f"{args.task}_head.pth"),
+            outputs_dir / "metrics.csv",
+            outputs_dir / "splits",
+            plots_dir,
+        ]
+        missing = [str(p) for p in required_paths if not p.exists()]
+        if missing:
+            print("警告: 归档存在缺失项:")
+            for m in missing:
+                print(f"  - {m}")
+        else:
+            print("归档检查通过：checkpoints / plots / splits 已生成。")
 
 
 if __name__ == "__main__":

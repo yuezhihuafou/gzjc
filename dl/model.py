@@ -44,25 +44,29 @@ class ResNet18_1D_Backbone(nn.Module):
     输出: 512 维特征向量 (B, 512)，不包含分类层。
     """
 
-    def __init__(self, in_channels: int = 2, embedding_dim: int = 512):
+    def __init__(self, in_channels: int = 2, embedding_dim: int = 512, base_channels: int = 64):
         super().__init__()
-        self.in_planes = 64
+        c1 = int(base_channels)
+        c2 = c1 * 2
+        c3 = c1 * 4
+        c4 = c1 * 8
+        self.in_planes = c1
 
         # stem
-        self.conv1 = nn.Conv1d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm1d(64)
+        self.conv1 = nn.Conv1d(in_channels, c1, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm1d(c1)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
 
         # ResNet-18 四个 stage
-        self.layer1 = self._make_layer(64, num_blocks=2, stride=1)
-        self.layer2 = self._make_layer(128, num_blocks=2, stride=2)
-        self.layer3 = self._make_layer(256, num_blocks=2, stride=2)
-        self.layer4 = self._make_layer(512, num_blocks=2, stride=2)
+        self.layer1 = self._make_layer(c1, num_blocks=2, stride=1)
+        self.layer2 = self._make_layer(c2, num_blocks=2, stride=2)
+        self.layer3 = self._make_layer(c3, num_blocks=2, stride=2)
+        self.layer4 = self._make_layer(c4, num_blocks=2, stride=2)
 
         # 全局池化 + 线性投影到 512 维 embedding
         self.global_pool = nn.AdaptiveAvgPool1d(1)
-        self.embedding = nn.Linear(512 * BasicBlock1D.expansion, embedding_dim, bias=False)
+        self.embedding = nn.Linear(c4 * BasicBlock1D.expansion, embedding_dim, bias=False)
         self.bn_embedding = nn.BatchNorm1d(embedding_dim)
 
         # 参数初始化
@@ -122,11 +126,23 @@ class ResNet18_1D_Backbone(nn.Module):
         return x
 
 
-def build_backbone(in_channels: int = 2, embedding_dim: int = 512) -> nn.Module:
+def build_backbone(
+    in_channels: int = 2,
+    embedding_dim: int = 512,
+    model_scale: str = "base",
+) -> nn.Module:
     """
     便捷构造函数，供训练和推理脚本使用。
     """
-    return ResNet18_1D_Backbone(in_channels=in_channels, embedding_dim=embedding_dim)
+    if model_scale == "large":
+        base_channels = 96
+    else:
+        base_channels = 64
+    return ResNet18_1D_Backbone(
+        in_channels=in_channels,
+        embedding_dim=embedding_dim,
+        base_channels=base_channels,
+    )
 
 
 __all__ = ["BasicBlock1D", "ResNet18_1D_Backbone", "build_backbone"]

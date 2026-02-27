@@ -20,6 +20,8 @@ RUNS_ROOT="experiments/runs"
 LOGS_ROOT="experiments/logs"
 CONDITION_POLICY="xjtu_3cond"
 SOUND_SPLIT_MODE="leave_one_condition_out"
+MODEL_SCALE="base"
+EMBEDDING_DIM="512"
 INNER_MODE=0
 
 usage() {
@@ -45,6 +47,8 @@ Options:
                                 sound_api_cache split mode (default: leave_one_condition_out)
   --condition_policy <xjtu_3cond|none>
                                 Condition infer policy (default: xjtu_3cond)
+  --model_scale <base|large>    Model scale (default: base)
+  --embedding_dim <n>           Embedding dim (default: 512 for base, 768 for large)
   -h, --help                    Show this help
 
 Examples:
@@ -70,6 +74,8 @@ while [[ $# -gt 0 ]]; do
     --epochs_formal) EPOCHS_FORMAL="$2"; shift 2 ;;
     --split_mode) SOUND_SPLIT_MODE="$2"; shift 2 ;;
     --condition_policy) CONDITION_POLICY="$2"; shift 2 ;;
+    --model_scale) MODEL_SCALE="$2"; shift 2 ;;
+    --embedding_dim) EMBEDDING_DIM="$2"; shift 2 ;;
     --inner) INNER_MODE=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *)
@@ -112,6 +118,8 @@ if [[ $USE_TMUX -eq 1 && $INNER_MODE -eq 0 ]]; then
     "--epochs_formal" "$EPOCHS_FORMAL"
     "--split_mode" "$SOUND_SPLIT_MODE"
     "--condition_policy" "$CONDITION_POLICY"
+    "--model_scale" "$MODEL_SCALE"
+    "--embedding_dim" "$EMBEDDING_DIM"
     "--inner"
   )
   CMD_STR=""
@@ -139,6 +147,8 @@ COMMON_ARGS=(
   --device "$DEVICE"
   --amp
   --workers "$WORKERS"
+  --model_scale "$MODEL_SCALE"
+  --embedding_dim "$EMBEDDING_DIM"
   --sound_split_mode "$SOUND_SPLIT_MODE"
   --condition_policy "$CONDITION_POLICY"
   --calibrate_threshold
