@@ -114,6 +114,11 @@ python experiments/train.py --data_source sound_api_cache --task risk --horizon 
 ```bash
 # 推理和Open-set检测
 python experiments/inference.py --data_source cwru --threshold 0.4
+
+# 跨域评估（XJTU 训练模型 -> CWRU）
+python tools/eval_cross_domain.py \
+  --checkpoint_dir experiments/runs/<run_name>/checkpoints \
+  --cwru_dir datasets/cwru/cwru_processed_risk
 ```
 
 ## 📁 项目结构
