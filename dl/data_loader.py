@@ -4,7 +4,7 @@ import json
 import re
 import hashlib
 from pathlib import Path
-from typing import Tuple, Optional, Dict, List
+from typing import Tuple, Optional, Dict, List, Any
 
 import numpy as np
 import torch
@@ -61,6 +61,58 @@ class LieGroupDataset(Dataset):
         return x_tensor, y_tensor
 
 
+class CWRUMultiTaskDataset(Dataset):
+    """
+    CWRU 多任务数据集：
+    - risk: 二分类 (0/1)
+    - fault: 四分类 (0/1/2/3)
+    - condition: 工况分类 (由 load+rpm 编码)
+    """
+
+    def __init__(
+        self,
+        signals: np.ndarray,
+        risk_labels: np.ndarray,
+        fault_labels: np.ndarray,
+        condition_labels: np.ndarray,
+        condition_ids: np.ndarray,
+        indices: np.ndarray,
+        channel_mean: np.ndarray,
+        channel_std: np.ndarray,
+    ) -> None:
+        super().__init__()
+        self.signals = signals
+        self.risk_labels = risk_labels.astype(np.float32)
+        self.fault_labels = fault_labels.astype(np.int64)
+        self.condition_labels = condition_labels.astype(np.int64)
+        self.condition_ids = np.array(condition_ids, dtype=object)
+        self.indices = indices.astype(np.int64)
+        self.channel_mean = channel_mean.reshape(2, 1)
+        self.channel_std = channel_std.reshape(2, 1)
+
+    def __len__(self) -> int:
+        return self.indices.shape[0]
+
+    def __getitem__(self, idx: int):
+        real_idx = int(self.indices[idx])
+        x = self.signals[real_idx]
+        x = (x - self.channel_mean) / (self.channel_std + 1e-8)
+
+        targets = {
+            "risk": torch.tensor(self.risk_labels[real_idx], dtype=torch.float32),
+            "fault": torch.tensor(self.fault_labels[real_idx], dtype=torch.long),
+            "condition": torch.tensor(self.condition_labels[real_idx], dtype=torch.long),
+        }
+        meta = {
+            "condition_id": str(self.condition_ids[real_idx]),
+            "fault_label": int(self.fault_labels[real_idx]),
+            "risk_binary": int(self.risk_labels[real_idx]),
+            "sample_id": real_idx,
+            "domain_id": "cwru",
+        }
+        return torch.from_numpy(x.astype(np.float32)), targets, meta
+
+
 def _load_numpy_arrays(
     base_dir: str = "cwru_processed",
     signals_name: str = "signals.npy",
@@ -98,6 +150,169 @@ def _load_numpy_arrays(
     return signals, labels
 
 
+def _load_cwru_condition_ids(
+    base_dir: str,
+    n_samples: int,
+) -> np.ndarray:
+    metadata_path = os.path.join(base_dir, "metadata.json")
+    if not os.path.exists(metadata_path):
+        return np.array(["cwru_unknown"] * n_samples, dtype=object)
+
+    with open(metadata_path, "r", encoding="utf-8") as f:
+        metadata = json.load(f)
+    if not isinstance(metadata, list):
+        raise ValueError(f"metadata.json 格式错误: {metadata_path}")
+    if len(metadata) != n_samples:
+        raise ValueError(
+            f"metadata.json 与样本数不一致: meta={len(metadata)}, samples={n_samples}"
+        )
+
+    cond_ids: List[str] = []
+    for m in metadata:
+        load_hp = m.get("load_hp", None)
+        rpm = m.get("rpm", None)
+        if load_hp is None or rpm is None:
+            cond_ids.append("cwru_unknown")
+        else:
+            cond_ids.append(f"load{int(load_hp)}_rpm{int(rpm)}")
+    return np.array(cond_ids, dtype=object)
+
+
+def get_cwru_multi_dataloaders(
+    batch_size: int = 64,
+    split_ratio: Tuple[float, float, float] = (0.7, 0.15, 0.15),
+    base_dir: str = "cwru_processed",
+    split_mode: str = "random",
+    test_condition_id: Optional[str] = None,
+    risk_semantics: str = "unified_binary",
+    seed: int = 42,
+    num_workers: int = 0,
+    shuffle: bool = True,
+    pin_memory: Optional[bool] = None,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    signals, fault_labels = _load_numpy_arrays(base_dir=base_dir)
+    n_samples = signals.shape[0]
+    condition_ids = _load_cwru_condition_ids(base_dir=base_dir, n_samples=n_samples)
+
+    if risk_semantics == "unified_binary":
+        risk_labels = (fault_labels > 0).astype(np.int64)
+    else:
+        risk_labels = fault_labels.astype(np.int64)
+
+    unique_conditions = sorted(str(c) for c in np.unique(condition_ids))
+    cond_to_idx = {cid: i for i, cid in enumerate(unique_conditions)}
+    condition_labels = np.array([cond_to_idx[str(c)] for c in condition_ids], dtype=np.int64)
+
+    train_ratio, val_ratio, test_ratio = split_ratio
+    if not np.isclose(train_ratio + val_ratio + test_ratio, 1.0):
+        raise ValueError(f"split_ratio 之和必须为 1，当前为: {split_ratio}")
+
+    if split_mode not in ("random", "leave_one_condition_out"):
+        raise ValueError("split_mode 仅支持 'random' 或 'leave_one_condition_out'")
+
+    if split_mode == "leave_one_condition_out":
+        train_indices, val_indices, test_indices = _split_leave_one_condition_out(
+            condition_ids=condition_ids,
+            split_ratio=split_ratio,
+            test_condition_id=test_condition_id,
+            seed=seed,
+        )
+    else:
+        n_train = int(n_samples * train_ratio)
+        n_val = int(n_samples * val_ratio)
+        all_indices = np.arange(n_samples)
+        if shuffle:
+            rng = np.random.default_rng(seed=seed)
+            rng.shuffle(all_indices)
+        train_indices = all_indices[:n_train]
+        val_indices = all_indices[n_train : n_train + n_val]
+        test_indices = all_indices[n_train + n_val :]
+
+    signals_train = signals[train_indices]
+    channel_mean = signals_train.mean(axis=(0, 2))
+    channel_std = signals_train.std(axis=(0, 2))
+
+    train_dataset = CWRUMultiTaskDataset(
+        signals=signals,
+        risk_labels=risk_labels,
+        fault_labels=fault_labels,
+        condition_labels=condition_labels,
+        condition_ids=condition_ids,
+        indices=train_indices,
+        channel_mean=channel_mean,
+        channel_std=channel_std,
+    )
+    val_dataset = CWRUMultiTaskDataset(
+        signals=signals,
+        risk_labels=risk_labels,
+        fault_labels=fault_labels,
+        condition_labels=condition_labels,
+        condition_ids=condition_ids,
+        indices=val_indices,
+        channel_mean=channel_mean,
+        channel_std=channel_std,
+    )
+    test_dataset = CWRUMultiTaskDataset(
+        signals=signals,
+        risk_labels=risk_labels,
+        fault_labels=fault_labels,
+        condition_labels=condition_labels,
+        condition_ids=condition_ids,
+        indices=test_indices,
+        channel_mean=channel_mean,
+        channel_std=channel_std,
+    )
+
+    # 供上层构建多头输出维度
+    train_dataset.condition_vocab = unique_conditions
+    val_dataset.condition_vocab = unique_conditions
+    test_dataset.condition_vocab = unique_conditions
+
+    if pin_memory is None:
+        pin_memory = torch.cuda.is_available()
+    persistent = num_workers > 0
+
+    def collate_fn(batch):
+        x_list, target_list, meta_list = zip(*batch)
+        x_batch = torch.stack(x_list)
+        out_targets: Dict[str, torch.Tensor] = {
+            "risk": torch.stack([t["risk"] for t in target_list]),
+            "fault": torch.stack([t["fault"] for t in target_list]),
+            "condition": torch.stack([t["condition"] for t in target_list]),
+        }
+        return x_batch, out_targets, list(meta_list)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent,
+        collate_fn=collate_fn,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent,
+        collate_fn=collate_fn,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent,
+        collate_fn=collate_fn,
+    )
+
+    return train_loader, val_loader, test_loader
+
+
 def get_dataloaders(
     batch_size: int = 64,
     split_ratio: Tuple[float, float, float] = (0.7, 0.15, 0.15),
@@ -106,6 +321,7 @@ def get_dataloaders(
     master_labels_path: Optional[str] = None,
     label_source_policy: str = "any",
     label_version: str = "latest",
+    risk_semantics: str = "unified_binary",
     test_condition_id: Optional[str] = None,
     seed: int = 42,
     num_workers: int = 0,
@@ -133,6 +349,10 @@ def get_dataloaders(
             label_source_policy=label_source_policy,
             label_version=label_version,
         )
+
+    # 统一 risk 语义：0=healthy, 1=faulty
+    if risk_semantics == "unified_binary":
+        labels = (labels > 0).astype(np.int64)
 
     n_samples = signals.shape[0]
 
@@ -370,6 +590,8 @@ def get_sound_api_cache_dataloaders(
     condition_policy: str = "xjtu_3cond",
     test_condition_id: Optional[str] = None,
     task: str = 'hi',
+    risk_semantics: str = "unified_binary",
+    use_condition_weight: bool = True,
     horizon: Optional[int] = None,
     num_workers: int = 0,
     pin_memory: Optional[bool] = None,
@@ -450,15 +672,18 @@ def get_sound_api_cache_dataloaders(
         print(f"  保留有标签样本: {len(samples)} 个")
         print(f"  标签分布: normal={n_normal}, fault={n_fault}")
     
+    # 统一补齐 data contract: domain_id / condition_id
+    cond_map = _load_condition_map(condition_map_path) if condition_map_path else {}
+    for s in samples:
+        s["domain_id"] = "sound_api_cache"
+        s["condition_id"] = _resolve_sound_condition_id(
+            sample=s,
+            condition_map=cond_map,
+            condition_policy=condition_policy,
+        )
+
     # bearing-level split / leave-one-condition-out
     if split_mode == "leave_one_condition_out":
-        cond_map = _load_condition_map(condition_map_path) if condition_map_path else {}
-        for s in samples:
-            s["condition_id"] = _resolve_sound_condition_id(
-                sample=s,
-                condition_map=cond_map,
-                condition_policy=condition_policy,
-            )
         train_samples, val_samples, test_samples = _split_sound_samples_by_condition(
             samples=samples,
             test_condition_id=test_condition_id,
@@ -475,6 +700,40 @@ def get_sound_api_cache_dataloaders(
     print(f"  训练集: {len(train_samples)} 样本 ({len(set(s['bearing_id'] for s in train_samples))} bearings)")
     print(f"  验证集: {len(val_samples)} 样本 ({len(set(s['bearing_id'] for s in val_samples))} bearings)")
     print(f"  测试集: {len(test_samples)} 样本 ({len(set(s['bearing_id'] for s in test_samples))} bearings)")
+
+    # 统一 risk 语义 + 样本权重（仅由训练集统计）
+    if task == "risk" and risk_semantics == "unified_binary":
+        def _rb(sample: Dict) -> int:
+            fl = int(sample.get("fault_label", -1))
+            return 1 if fl > 0 else 0
+
+        class_counts: Dict[int, int] = {0: 0, 1: 0}
+        cond_counts: Dict[str, int] = {}
+        for s in train_samples:
+            rb = _rb(s)
+            class_counts[rb] = class_counts.get(rb, 0) + 1
+            cid = str(s.get("condition_id", "unknown") or "unknown")
+            cond_counts[cid] = cond_counts.get(cid, 0) + 1
+
+        n_train = max(1, len(train_samples))
+        w_class = {k: (n_train / max(1, v)) for k, v in class_counts.items()}
+
+        def _assign_weights(target_samples: List[Dict]) -> None:
+            for s in target_samples:
+                rb = _rb(s)
+                cid = str(s.get("condition_id", "unknown") or "unknown")
+                w_c = w_class.get(rb, 1.0)
+                if use_condition_weight:
+                    w_cond = n_train / max(1, cond_counts.get(cid, 1))
+                else:
+                    w_cond = 1.0
+                w = float(np.sqrt(w_c * w_cond))
+                s["risk_binary"] = int(rb)
+                s["sample_weight"] = float(np.clip(w, 0.5, 3.0))
+
+        _assign_weights(train_samples)
+        _assign_weights(val_samples)
+        _assign_weights(test_samples)
     
     # 在训练集上计算通道均值/方差（带缓存，加速后续重复训练）
     print("计算训练集统计量...")
@@ -712,4 +971,10 @@ def _split_sound_samples_by_condition(
     return train_samples, val_samples, test_samples
 
 
-__all__ = ["LieGroupDataset", "get_dataloaders", "get_sound_api_cache_dataloaders"]
+__all__ = [
+    "LieGroupDataset",
+    "CWRUMultiTaskDataset",
+    "get_dataloaders",
+    "get_cwru_multi_dataloaders",
+    "get_sound_api_cache_dataloaders",
+]

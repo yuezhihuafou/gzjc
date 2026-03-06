@@ -19,7 +19,7 @@ import csv
 import json
 import random
 from datetime import datetime
-from typing import Tuple, Dict, List, Optional
+from typing import Tuple, Dict, List, Optional, Any
 from pathlib import Path
 
 import numpy as np
@@ -34,7 +34,11 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-from dl.data_loader import get_dataloaders, get_sound_api_cache_dataloaders
+from dl.data_loader import (
+    get_dataloaders,
+    get_cwru_multi_dataloaders,
+    get_sound_api_cache_dataloaders,
+)
 from dl.sound_data_loader import get_sound_dataloaders
 from dl.sound_api_data_loader import get_sound_api_dataloaders
 from dl.model import build_backbone
@@ -66,6 +70,31 @@ class BinaryClassificationHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.dropout(x)
         return self.fc(x).squeeze(-1)  # (B,)
+
+
+class MultiTaskHead(nn.Module):
+    """共享骨干的多头输出：risk/fault/condition"""
+
+    def __init__(
+        self,
+        in_features: int = 512,
+        n_fault_classes: int = 4,
+        n_condition_classes: int = 4,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0 else nn.Identity()
+        self.risk_fc = nn.Linear(in_features, 1)
+        self.fault_fc = nn.Linear(in_features, n_fault_classes)
+        self.condition_fc = nn.Linear(in_features, n_condition_classes)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        z = self.dropout(x)
+        return {
+            "risk": self.risk_fc(z).squeeze(-1),
+            "fault": self.fault_fc(z),
+            "condition": self.condition_fc(z),
+        }
 
 
 def train_one_epoch_arcface(
@@ -199,14 +228,38 @@ def train_one_epoch_binary(
             with torch.amp.autocast(device_type="cuda"):
                 features = backbone(x)
                 logits = head(features)
-                loss = criterion(logits, y)
+                raw_loss = criterion(logits, y)
+                if isinstance(raw_loss, torch.Tensor) and raw_loss.ndim > 0:
+                    if meta:
+                        sw = torch.tensor(
+                            [float(m.get("sample_weight", 1.0)) for m in meta],
+                            dtype=raw_loss.dtype,
+                            device=raw_loss.device,
+                        )
+                        loss = (raw_loss * sw).mean()
+                    else:
+                        loss = raw_loss.mean()
+                else:
+                    loss = raw_loss
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
             features = backbone(x)
             logits = head(features)
-            loss = criterion(logits, y)
+            raw_loss = criterion(logits, y)
+            if isinstance(raw_loss, torch.Tensor) and raw_loss.ndim > 0:
+                if meta:
+                    sw = torch.tensor(
+                        [float(m.get("sample_weight", 1.0)) for m in meta],
+                        dtype=raw_loss.dtype,
+                        device=raw_loss.device,
+                    )
+                    loss = (raw_loss * sw).mean()
+                else:
+                    loss = raw_loss.mean()
+            else:
+                loss = raw_loss
             loss.backward()
             optimizer.step()
 
@@ -218,6 +271,117 @@ def train_one_epoch_binary(
     epoch_loss = running_loss / total
     epoch_acc = correct / total
     return epoch_loss, epoch_acc
+
+
+def train_one_epoch_multi(
+    backbone: nn.Module,
+    head: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    loss_fns: Dict[str, nn.Module],
+    loss_weights: Dict[str, float],
+    dataloader: DataLoader,
+    device: torch.device,
+    use_amp: bool = False,
+    scaler: Optional["torch.amp.GradScaler"] = None,
+) -> Tuple[float, Dict[str, float]]:
+    backbone.train()
+    head.train()
+
+    running_total = 0.0
+    running_risk = 0.0
+    running_fault = 0.0
+    running_condition = 0.0
+    n = 0
+
+    risk_correct = 0
+    fault_correct = 0
+    condition_correct = 0
+
+    for x, targets, meta in tqdm(dataloader, desc="Train", leave=False):
+        x = x.to(device, non_blocking=True)
+        y_risk = targets["risk"].to(device, non_blocking=True).float()
+        y_fault = targets["fault"].to(device, non_blocking=True).long()
+        y_cond = targets["condition"].to(device, non_blocking=True).long()
+        bs = x.size(0)
+
+        optimizer.zero_grad()
+        if use_amp and device.type == "cuda":
+            with torch.amp.autocast(device_type="cuda"):
+                feats = backbone(x)
+                out = head(feats)
+                raw_risk = loss_fns["risk"](out["risk"], y_risk)
+                if isinstance(raw_risk, torch.Tensor) and raw_risk.ndim > 0:
+                    if meta:
+                        sw = torch.tensor(
+                            [float(m.get("sample_weight", 1.0)) for m in meta],
+                            dtype=raw_risk.dtype,
+                            device=raw_risk.device,
+                        )
+                        loss_risk = (raw_risk * sw).mean()
+                    else:
+                        loss_risk = raw_risk.mean()
+                else:
+                    loss_risk = raw_risk
+                loss_fault = loss_fns["fault"](out["fault"], y_fault)
+                loss_cond = loss_fns["condition"](out["condition"], y_cond)
+                loss = (
+                    float(loss_weights["risk"]) * loss_risk
+                    + float(loss_weights["fault"]) * loss_fault
+                    + float(loss_weights["condition"]) * loss_cond
+                )
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            feats = backbone(x)
+            out = head(feats)
+            raw_risk = loss_fns["risk"](out["risk"], y_risk)
+            if isinstance(raw_risk, torch.Tensor) and raw_risk.ndim > 0:
+                if meta:
+                    sw = torch.tensor(
+                        [float(m.get("sample_weight", 1.0)) for m in meta],
+                        dtype=raw_risk.dtype,
+                        device=raw_risk.device,
+                    )
+                    loss_risk = (raw_risk * sw).mean()
+                else:
+                    loss_risk = raw_risk.mean()
+            else:
+                loss_risk = raw_risk
+            loss_fault = loss_fns["fault"](out["fault"], y_fault)
+            loss_cond = loss_fns["condition"](out["condition"], y_cond)
+            loss = (
+                float(loss_weights["risk"]) * loss_risk
+                + float(loss_weights["fault"]) * loss_fault
+                + float(loss_weights["condition"]) * loss_cond
+            )
+            loss.backward()
+            optimizer.step()
+
+        running_total += float(loss.item()) * bs
+        running_risk += float(loss_risk.item()) * bs
+        running_fault += float(loss_fault.item()) * bs
+        running_condition += float(loss_cond.item()) * bs
+        n += bs
+
+        risk_pred = (torch.sigmoid(out["risk"]) > 0.5).long()
+        risk_correct += int((risk_pred == y_risk.long()).sum().item())
+        fault_pred = torch.argmax(out["fault"], dim=1)
+        fault_correct += int((fault_pred == y_fault).sum().item())
+        cond_pred = torch.argmax(out["condition"], dim=1)
+        condition_correct += int((cond_pred == y_cond).sum().item())
+
+    if n == 0:
+        return 0.0, {"risk_acc": 0.0, "fault_acc": 0.0, "condition_acc": 0.0}
+    metrics = {
+        "risk_acc": risk_correct / n,
+        "fault_acc": fault_correct / n,
+        "condition_acc": condition_correct / n,
+        "loss_risk": running_risk / n,
+        "loss_fault": running_fault / n,
+        "loss_condition": running_condition / n,
+    }
+    return running_total / n, metrics
 
 
 def evaluate_arcface(
@@ -339,7 +503,19 @@ def evaluate_binary(
 
         features = backbone(x)
         logits = head(features)
-        loss = criterion(logits, y)
+        raw_loss = criterion(logits, y)
+        if isinstance(raw_loss, torch.Tensor) and raw_loss.ndim > 0:
+            if meta:
+                sw = torch.tensor(
+                    [float(m.get("sample_weight", 1.0)) for m in meta],
+                    dtype=raw_loss.dtype,
+                    device=raw_loss.device,
+                )
+                loss = (raw_loss * sw).mean()
+            else:
+                loss = raw_loss.mean()
+        else:
+            loss = raw_loss
 
         running_loss += loss.item() * x.size(0)
         probs = torch.sigmoid(logits)
@@ -368,6 +544,262 @@ def evaluate_binary(
         pr_auc = 0.0
     
     return epoch_loss, epoch_acc, preds, targets, all_meta, auc, pr_auc
+
+
+def evaluate_multi(
+    backbone: nn.Module,
+    head: nn.Module,
+    loss_fns: Dict[str, nn.Module],
+    loss_weights: Dict[str, float],
+    dataloader: DataLoader,
+    device: torch.device,
+    risk_threshold: float = 0.5,
+) -> Dict[str, Any]:
+    backbone.eval()
+    head.eval()
+
+    running_total = 0.0
+    running_risk = 0.0
+    running_fault = 0.0
+    running_condition = 0.0
+    n = 0
+
+    risk_probs_all: List[np.ndarray] = []
+    risk_targets_all: List[np.ndarray] = []
+    fault_logits_all: List[np.ndarray] = []
+    fault_targets_all: List[np.ndarray] = []
+    cond_logits_all: List[np.ndarray] = []
+    cond_targets_all: List[np.ndarray] = []
+    meta_all: List[Dict[str, Any]] = []
+
+    with torch.no_grad():
+        for x, targets, meta in tqdm(dataloader, desc="Val", leave=False):
+            x = x.to(device)
+            y_risk = targets["risk"].to(device).float()
+            y_fault = targets["fault"].to(device).long()
+            y_cond = targets["condition"].to(device).long()
+            bs = x.size(0)
+
+            feats = backbone(x)
+            out = head(feats)
+
+            raw_risk = loss_fns["risk"](out["risk"], y_risk)
+            if isinstance(raw_risk, torch.Tensor) and raw_risk.ndim > 0:
+                if meta:
+                    sw = torch.tensor(
+                        [float(m.get("sample_weight", 1.0)) for m in meta],
+                        dtype=raw_risk.dtype,
+                        device=raw_risk.device,
+                    )
+                    loss_risk = (raw_risk * sw).mean()
+                else:
+                    loss_risk = raw_risk.mean()
+            else:
+                loss_risk = raw_risk
+            loss_fault = loss_fns["fault"](out["fault"], y_fault)
+            loss_cond = loss_fns["condition"](out["condition"], y_cond)
+            loss = (
+                float(loss_weights["risk"]) * loss_risk
+                + float(loss_weights["fault"]) * loss_fault
+                + float(loss_weights["condition"]) * loss_cond
+            )
+
+            running_total += float(loss.item()) * bs
+            running_risk += float(loss_risk.item()) * bs
+            running_fault += float(loss_fault.item()) * bs
+            running_condition += float(loss_cond.item()) * bs
+            n += bs
+
+            risk_probs_all.append(torch.sigmoid(out["risk"]).cpu().numpy())
+            risk_targets_all.append(y_risk.cpu().numpy())
+            fault_logits_all.append(out["fault"].cpu().numpy())
+            fault_targets_all.append(y_fault.cpu().numpy())
+            cond_logits_all.append(out["condition"].cpu().numpy())
+            cond_targets_all.append(y_cond.cpu().numpy())
+            meta_all.extend(list(meta))
+
+    if n == 0:
+        return {
+            "loss": 0.0,
+            "loss_risk": 0.0,
+            "loss_fault": 0.0,
+            "loss_condition": 0.0,
+            "risk_probs": np.array([], dtype=np.float32),
+            "risk_targets": np.array([], dtype=np.float32),
+            "fault_logits": np.zeros((0, 4), dtype=np.float32),
+            "fault_targets": np.array([], dtype=np.int64),
+            "condition_logits": np.zeros((0, 1), dtype=np.float32),
+            "condition_targets": np.array([], dtype=np.int64),
+            "meta": [],
+        }
+
+    return {
+        "loss": running_total / n,
+        "loss_risk": running_risk / n,
+        "loss_fault": running_fault / n,
+        "loss_condition": running_condition / n,
+        "risk_probs": np.concatenate(risk_probs_all),
+        "risk_targets": np.concatenate(risk_targets_all),
+        "fault_logits": np.concatenate(fault_logits_all),
+        "fault_targets": np.concatenate(fault_targets_all),
+        "condition_logits": np.concatenate(cond_logits_all),
+        "condition_targets": np.concatenate(cond_targets_all),
+        "meta": meta_all,
+        "risk_threshold": float(risk_threshold),
+    }
+
+
+def compute_binary_metrics(
+    preds: np.ndarray,
+    targets: np.ndarray,
+    threshold: float = 0.5,
+) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    pred_prob = np.asarray(preds).reshape(-1)
+    tgt = np.asarray(targets).reshape(-1).astype(np.int64)
+    pred_label = (pred_prob > threshold).astype(np.int64)
+    out["acc"] = float(np.mean(pred_label == tgt))
+    try:
+        from sklearn.metrics import (
+            roc_auc_score,
+            average_precision_score,
+            balanced_accuracy_score,
+            f1_score,
+            recall_score,
+        )
+        if np.unique(tgt).size >= 2:
+            out["auc"] = float(roc_auc_score(tgt, pred_prob))
+            out["pr_auc"] = float(average_precision_score(tgt, pred_prob))
+            out["balanced_acc"] = float(balanced_accuracy_score(tgt, pred_label))
+            out["f1"] = float(f1_score(tgt, pred_label, zero_division=0))
+            out["normal_recall"] = float(recall_score(tgt, pred_label, pos_label=0, zero_division=0))
+        else:
+            out["auc"] = 0.0
+            out["pr_auc"] = 0.0
+            out["balanced_acc"] = 0.0
+            out["f1"] = 0.0
+            out["normal_recall"] = 0.0
+    except Exception:
+        out["auc"] = 0.0
+        out["pr_auc"] = 0.0
+        out["balanced_acc"] = 0.0
+        out["f1"] = 0.0
+        out["normal_recall"] = 0.0
+    return out
+
+
+def compute_multiclass_metrics(
+    logits: np.ndarray,
+    targets: np.ndarray,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    y_true = np.asarray(targets).reshape(-1).astype(np.int64)
+    logits_arr = np.asarray(logits)
+    if logits_arr.size == 0 or y_true.size == 0:
+        return {
+            "acc": 0.0,
+            "macro_f1": 0.0,
+            "labels": [],
+            "confusion_matrix": [],
+        }
+    if logits_arr.ndim == 1:
+        logits_arr = logits_arr.reshape(-1, 1)
+    n = min(int(logits_arr.shape[0]), int(y_true.shape[0]))
+    if n <= 0:
+        return {
+            "acc": 0.0,
+            "macro_f1": 0.0,
+            "labels": [],
+            "confusion_matrix": [],
+        }
+    logits_arr = logits_arr[:n]
+    y_true = y_true[:n]
+    y_pred = np.argmax(logits_arr, axis=1).astype(np.int64)
+    out["acc"] = float(np.mean(y_pred == y_true))
+    try:
+        from sklearn.metrics import f1_score, confusion_matrix
+
+        out["macro_f1"] = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+        labels = sorted(np.unique(np.concatenate([y_true, y_pred])).tolist()) if y_true.size > 0 else [0]
+        cm = confusion_matrix(y_true, y_pred, labels=labels)
+        out["labels"] = labels
+        out["confusion_matrix"] = cm.tolist()
+    except Exception:
+        out["macro_f1"] = 0.0
+        out["labels"] = []
+        out["confusion_matrix"] = []
+    return out
+
+
+def save_multiclass_metrics_csv(
+    csv_path: Path,
+    metrics: Dict[str, Any],
+) -> None:
+    rows: Dict[str, Any] = {
+        "acc": metrics.get("acc", 0.0),
+        "macro_f1": metrics.get("macro_f1", 0.0),
+        "labels": json.dumps(metrics.get("labels", []), ensure_ascii=False),
+        "confusion_matrix": json.dumps(metrics.get("confusion_matrix", []), ensure_ascii=False),
+    }
+    save_metrics_csv(csv_path, rows)
+
+
+def apply_risk_direction(probs: np.ndarray, direction: str) -> np.ndarray:
+    """方向校准：normal=原分数，inverted=1-p。"""
+    p = np.asarray(probs).reshape(-1).astype(np.float64)
+    if str(direction).lower() in ("inverted", "inverse", "neg", "reverse", "-1"):
+        return 1.0 - p
+    return p
+
+
+def calibrate_risk_postprocess(
+    targets: np.ndarray,
+    probs: np.ndarray,
+    default_threshold: float = 0.5,
+    allow_invert: bool = True,
+    tune_threshold: bool = True,
+    metric: str = "balanced_acc",
+) -> Dict[str, float]:
+    """
+    在验证集联合校准 score direction + threshold。
+    metric: balanced_acc / f1
+    """
+    y = np.asarray(targets).reshape(-1).astype(np.int64)
+    p = np.asarray(probs).reshape(-1).astype(np.float64)
+
+    if y.size == 0:
+        return {"direction": "normal", "threshold": float(default_threshold), "score": 0.0}
+
+    directions = ["normal", "inverted"] if allow_invert else ["normal"]
+    if tune_threshold:
+        threshold_grid = np.linspace(0.01, 0.99, 99)
+    else:
+        threshold_grid = np.array([float(default_threshold)], dtype=np.float64)
+
+    best = {
+        "direction": "normal",
+        "threshold": float(default_threshold),
+        "score": -1.0,
+        "auc": -1.0,
+    }
+
+    for direction in directions:
+        s = apply_risk_direction(p, direction)
+        dir_auc = float(compute_binary_metrics(s, y, threshold=0.5).get("auc", 0.0))
+        for th in threshold_grid:
+            m = compute_binary_metrics(s, y, threshold=float(th))
+            score = float(m.get("f1", 0.0)) if metric == "f1" else float(m.get("balanced_acc", 0.0))
+            if (score > best["score"]) or (
+                abs(score - best["score"]) <= 1e-12 and dir_auc > best["auc"]
+            ):
+                best = {
+                    "direction": direction,
+                    "threshold": float(th),
+                    "score": score,
+                    "auc": dir_auc,
+                }
+
+    return best
 
 
 def calibrate_binary_threshold(
@@ -574,6 +1006,14 @@ def save_metrics_csv(metrics_path: Path, metrics: Dict[str, float]) -> None:
             writer.writerow([k, v])
 
 
+def get_head_checkpoint_name(task: str) -> str:
+    if task == "arcface":
+        return "arcface_head.pth"
+    if task == "multi":
+        return "multi_head.pth"
+    return f"{task}_head.pth"
+
+
 def save_risk_predictions_csv(
     csv_path: Path,
     preds: np.ndarray,
@@ -614,22 +1054,106 @@ def save_risk_condition_metrics_csv(
 
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["condition_id", "n_samples", "acc", "auc", "pr_auc"])
+        writer.writerow(["condition_id", "n_samples", "acc", "auc", "pr_auc", "balanced_acc", "f1", "normal_recall"])
         for cid in sorted(groups.keys()):
             idx = groups[cid]
             p = preds[idx]
             t = targets[idx]
-            acc = float(np.mean((p > threshold).astype(np.float32) == t.astype(np.float32)))
-            auc = ""
-            pr_auc = ""
-            try:
-                from sklearn.metrics import roc_auc_score, average_precision_score
-                if np.unique(t).size >= 2:
-                    auc = float(roc_auc_score(t, p))
-                    pr_auc = float(average_precision_score(t, p))
-            except Exception:
-                pass
-            writer.writerow([cid, len(idx), acc, auc, pr_auc])
+            m = compute_binary_metrics(p, t, threshold=threshold)
+            writer.writerow([
+                cid,
+                len(idx),
+                m.get("acc", ""),
+                m.get("auc", ""),
+                m.get("pr_auc", ""),
+                m.get("balanced_acc", ""),
+                m.get("f1", ""),
+                m.get("normal_recall", ""),
+            ])
+
+
+def save_risk_domain_metrics_csv(
+    csv_path: Path,
+    rows: List[Dict[str, float]],
+) -> None:
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["domain_id", "n_samples", "acc", "auc", "pr_auc", "balanced_acc", "f1", "normal_recall"])
+        for r in rows:
+            writer.writerow([
+                r.get("domain_id", ""),
+                r.get("n_samples", 0),
+                r.get("acc", ""),
+                r.get("auc", ""),
+                r.get("pr_auc", ""),
+                r.get("balanced_acc", ""),
+                r.get("f1", ""),
+                r.get("normal_recall", ""),
+            ])
+
+
+def estimate_pos_weight_from_loader(train_loader: DataLoader) -> float:
+    neg = 0
+    pos = 0
+    for batch in train_loader:
+        if len(batch) == 3:
+            _, y, _ = batch
+        else:
+            _, y = batch
+        if isinstance(y, dict):
+            y_tensor = y.get("risk")
+            if y_tensor is None:
+                continue
+            y_np = y_tensor.detach().cpu().numpy().astype(np.int64).reshape(-1)
+        else:
+            y_np = y.detach().cpu().numpy().astype(np.int64).reshape(-1)
+        pos += int((y_np > 0).sum())
+        neg += int((y_np == 0).sum())
+    if pos <= 0:
+        return 1.0
+    return float(max(1.0, neg / max(1, pos)))
+
+
+def semantic_check_report(
+    data_source: str,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    test_loader: DataLoader,
+) -> Dict:
+    def _summarize_loader(name: str, loader: DataLoader) -> Dict:
+        ds = loader.dataset
+        report = {"split": name, "n_samples": len(ds)}
+        if hasattr(ds, "samples"):
+            samples = list(getattr(ds, "samples"))
+            rb = [int(s.get("risk_binary", 1 if int(s.get("fault_label", 0)) > 0 else 0)) for s in samples]
+            cond = [str(s.get("condition_id", "unknown") or "unknown") for s in samples]
+            sw = [float(s.get("sample_weight", 1.0)) for s in samples]
+            report["risk_binary_dist"] = {str(k): int(v) for k, v in zip(*np.unique(rb, return_counts=True))}
+            report["condition_id_dist"] = {str(k): int(v) for k, v in zip(*np.unique(cond, return_counts=True))}
+            report["sample_weight_min"] = float(np.min(sw)) if len(sw) else 0.0
+            report["sample_weight_max"] = float(np.max(sw)) if len(sw) else 0.0
+        else:
+            idx = getattr(ds, "indices", None)
+            labels = getattr(ds, "labels", None)
+            condition_ids = getattr(ds, "condition_ids", None)
+            if idx is not None and labels is not None:
+                y = labels[idx]
+                report["risk_binary_dist"] = {str(k): int(v) for k, v in zip(*np.unique((y > 0).astype(np.int64), return_counts=True))}
+            if idx is not None and condition_ids is not None:
+                c = np.array(condition_ids, dtype=object)[idx]
+                report["condition_id_dist"] = {str(k): int(v) for k, v in zip(*np.unique(c, return_counts=True))}
+            report["sample_weight_min"] = 1.0
+            report["sample_weight_max"] = 1.0
+        return report
+
+    return {
+        "data_source": data_source,
+        "splits": [
+            _summarize_loader("train", train_loader),
+            _summarize_loader("val", val_loader),
+            _summarize_loader("test", test_loader),
+        ],
+    }
 
 
 def set_global_seed(seed: int, deterministic: bool = False) -> None:
@@ -655,9 +1179,46 @@ def main():
     parser.add_argument(
         '--task',
         type=str,
-        choices=['hi', 'risk', 'arcface'],
+        choices=['hi', 'risk', 'arcface', 'multi'],
         default='risk',
-        help='任务类型: hi (健康指数回归), risk (风险预测/故障检测), arcface (分类)'
+        help='任务类型: hi (健康指数回归), risk (风险预测), arcface (分类), multi (risk+fault+condition 多头)'
+    )
+    parser.add_argument(
+        '--risk_semantics',
+        type=str,
+        choices=['unified_binary'],
+        default='unified_binary',
+        help='risk 语义定义（默认统一为 healthy/faulty 二值）'
+    )
+    parser.add_argument(
+        '--use_condition_weight',
+        action='store_true',
+        default=True,
+        help='risk 任务启用工况权重（默认开启）'
+    )
+    parser.add_argument(
+        '--no_condition_weight',
+        action='store_true',
+        help='关闭 risk 工况权重（调试/对照实验用）'
+    )
+    parser.add_argument(
+        '--eval_protocol',
+        type=str,
+        choices=['in_domain', 'leave_one_domain_out'],
+        default='leave_one_domain_out',
+        help='评估协议（默认留一域测试）'
+    )
+    parser.add_argument(
+        '--test_domain',
+        type=str,
+        choices=['cwru', 'sound_api_cache'],
+        default='cwru',
+        help='leave_one_domain_out 时的目标测试域'
+    )
+    parser.add_argument(
+        '--semantic_check_only',
+        action='store_true',
+        help='仅做语义一致性检查并输出报告，不训练'
     )
     parser.add_argument(
         '--batch_size',
@@ -802,6 +1363,31 @@ def main():
         action='store_true',
         help='在验证集自动校准风险阈值（F1 最优）'
     )
+    parser.add_argument(
+        '--calibrate_sign',
+        action='store_true',
+        default=True,
+        help='在验证集自动校准风险分数方向（normal / inverted，默认开启）'
+    )
+    parser.add_argument(
+        '--no_calibrate_sign',
+        action='store_true',
+        help='关闭风险分数方向自动校准'
+    )
+    parser.add_argument(
+        '--risk_calibration_metric',
+        type=str,
+        choices=['balanced_acc', 'f1'],
+        default='balanced_acc',
+        help='风险后处理校准目标（默认 balanced_acc）'
+    )
+    parser.add_argument(
+        '--risk_score_direction',
+        type=str,
+        choices=['auto', 'normal', 'inverted'],
+        default='auto',
+        help='风险分数方向: auto(验证集自动校准) / normal / inverted'
+    )
     # sound_api_cache 相关参数
     parser.add_argument(
         '--cache_dir',
@@ -821,6 +1407,29 @@ def main():
         type=str,
         default=None,
         help='音频文件目录 (仅用于 sound_api 数据源)'
+    )
+    parser.add_argument(
+        '--sound_data_dir',
+        type=str,
+        default='声音能量曲线数据',
+        help='本地 xlsx 声音数据目录 (仅用于 sound 数据源)'
+    )
+    parser.add_argument(
+        '--sound_log1p_volume',
+        action='store_true',
+        default=True,
+        help='sound 数据源使用 log1p(volume)+density（默认开启）'
+    )
+    parser.add_argument(
+        '--no_sound_log1p_volume',
+        action='store_true',
+        help='关闭 sound 数据源的 log1p(volume) 变换（对照实验）'
+    )
+    parser.add_argument(
+        '--sound_metadata_path',
+        type=str,
+        default='cwru_processed/metadata.json',
+        help='sound 数据源标签元数据路径 (默认使用 CWRU metadata.json)'
     )
     parser.add_argument(
         '--api_cache_dir',
@@ -849,6 +1458,22 @@ def main():
         type=str,
         default='checkpoints',
         help='checkpoint 目录 (eval_only 时使用)'
+    )
+    parser.add_argument(
+        '--init_checkpoint_dir',
+        type=str,
+        default=None,
+        help='训练前初始化权重目录（可选），包含 backbone.pth 和 <task>_head.pth'
+    )
+    parser.add_argument(
+        '--init_backbone_only',
+        action='store_true',
+        help='初始化时仅加载 backbone.pth，跳过 head 权重检查和加载'
+    )
+    parser.add_argument(
+        '--freeze_backbone',
+        action='store_true',
+        help='仅训练任务 head，冻结 backbone（用于目标域小步适配）'
     )
     parser.add_argument(
         '--device',
@@ -911,6 +1536,24 @@ def main():
         help='头部 dropout 比例（默认 0.0，扩容模型可用 0.1）'
     )
     parser.add_argument(
+        '--loss_w_risk',
+        type=float,
+        default=1.0,
+        help='multi ?? risk ???????? 1.0?'
+    )
+    parser.add_argument(
+        '--loss_w_fault',
+        type=float,
+        default=1.0,
+        help='multi ?? fault ???????? 1.0?'
+    )
+    parser.add_argument(
+        '--loss_w_condition',
+        type=float,
+        default=0.5,
+        help='multi ?? condition ???????? 0.5?'
+    )
+    parser.add_argument(
         '--runs_root',
         type=str,
         default='experiments/runs',
@@ -929,6 +1572,17 @@ def main():
     )
     
     args = parser.parse_args()
+    if getattr(args, "no_condition_weight", False):
+        args.use_condition_weight = False
+    if getattr(args, "no_calibrate_sign", False):
+        args.calibrate_sign = False
+    if getattr(args, "no_sound_log1p_volume", False):
+        args.sound_log1p_volume = False
+    forced_risk_direction = (
+        args.risk_score_direction
+        if args.task in ("risk", "multi") and args.risk_score_direction in ("normal", "inverted")
+        else None
+    )
 
     # 默认策略：XJTU 主线训练，CWRU 仅评估
     if args.data_source == 'cwru' and (not args.allow_cwru_train) and (not args.eval_only):
@@ -1010,6 +1664,8 @@ def main():
     print(f"批大小: {batch_size}, 训练轮数: {epochs}, 学习率: {lr}")
     print(f"模型规模: {args.model_scale}, embedding_dim: {embedding_dim}, head_dropout: {args.head_dropout}")
     print(f"随机种子: {args.seed}, deterministic={args.deterministic}")
+    if args.task == "multi" and args.data_source != "cwru":
+        raise ValueError("task=multi 当前仅支持 CWRU，请使用 --data_source cwru")
     if args.data_source == "sound_api_cache":
         print("运行模式: XJTU 优先主线（sound_api_cache）")
     elif args.data_source == "cwru":
@@ -1023,8 +1679,16 @@ def main():
         outputs_dir = Path("experiments/outputs")
         plots_dir = outputs_dir / "plots"
         metrics_path = outputs_dir / "metrics.csv"
+        overall_metrics_path = outputs_dir / "overall_metrics.csv"
         risk_pred_path = outputs_dir / "risk_predictions.csv"
         risk_cond_metrics_path = outputs_dir / "risk_condition_metrics.csv"
+        risk_domain_metrics_path = outputs_dir / "risk_domain_metrics.csv"
+        per_condition_metrics_path = outputs_dir / "per_condition_metrics.csv"
+        per_domain_metrics_path = outputs_dir / "per_domain_metrics.csv"
+        risk_score_direction_path = outputs_dir / "risk_score_direction.txt"
+        risk_metrics_path = outputs_dir / "risk_metrics.csv"
+        fault_metrics_path = outputs_dir / "fault_metrics.csv"
+        condition_metrics_path = outputs_dir / "condition_metrics.csv"
     else:
         run_name = args.run_name or build_run_name(args)
         run_dir = Path(args.runs_root) / run_name
@@ -1032,13 +1696,52 @@ def main():
         outputs_dir = run_dir / "outputs"
         plots_dir = outputs_dir / "plots"
         metrics_path = outputs_dir / "metrics.csv"
+        overall_metrics_path = outputs_dir / "overall_metrics.csv"
         risk_pred_path = outputs_dir / "risk_predictions.csv"
         risk_cond_metrics_path = outputs_dir / "risk_condition_metrics.csv"
+        risk_domain_metrics_path = outputs_dir / "risk_domain_metrics.csv"
+        per_condition_metrics_path = outputs_dir / "per_condition_metrics.csv"
+        per_domain_metrics_path = outputs_dir / "per_domain_metrics.csv"
+        risk_score_direction_path = outputs_dir / "risk_score_direction.txt"
+        risk_metrics_path = outputs_dir / "risk_metrics.csv"
+        fault_metrics_path = outputs_dir / "fault_metrics.csv"
+        condition_metrics_path = outputs_dir / "condition_metrics.csv"
         ckpt_out_dir.mkdir(parents=True, exist_ok=True)
         plots_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "outputs" / "splits").mkdir(parents=True, exist_ok=True)
         save_run_config(run_dir, args, device)
         print(f"实验归档目录: {run_dir}")
+
+    def calibrate_risk_with_config(
+        targets: np.ndarray,
+        probs: np.ndarray,
+        default_threshold: float,
+    ) -> Dict[str, float]:
+        """按 CLI 约束进行风险后处理校准。"""
+        if forced_risk_direction in ("normal", "inverted"):
+            fixed_scores = apply_risk_direction(probs, forced_risk_direction)
+            cal = calibrate_risk_postprocess(
+                targets=targets,
+                probs=fixed_scores,
+                default_threshold=default_threshold,
+                allow_invert=False,
+                tune_threshold=bool(args.calibrate_threshold),
+                metric=args.risk_calibration_metric,
+            )
+            return {
+                "direction": forced_risk_direction,
+                "threshold": float(cal.get("threshold", default_threshold)),
+                "score": float(cal.get("score", 0.0)),
+                "auc": float(cal.get("auc", 0.0)),
+            }
+        return calibrate_risk_postprocess(
+            targets=targets,
+            probs=probs,
+            default_threshold=default_threshold,
+            allow_invert=bool(args.calibrate_sign),
+            tune_threshold=bool(args.calibrate_threshold),
+            metric=args.risk_calibration_metric,
+        )
 
     # 数据加载
     workers = getattr(args, 'workers', 0)
@@ -1047,6 +1750,12 @@ def main():
         train_loader, val_loader, test_loader = get_sound_dataloaders(
             batch_size=batch_size,
             split_ratio=split_ratio,
+            sound_data_dir=args.sound_data_dir,
+            metadata_path=args.sound_metadata_path,
+            task=args.task,
+            risk_semantics=args.risk_semantics,
+            use_log1p_volume=args.sound_log1p_volume,
+            seed=args.seed,
             num_workers=workers,
         )
     elif args.data_source == 'sound_api':
@@ -1073,6 +1782,8 @@ def main():
             condition_policy=args.condition_policy,
             test_condition_id=args.test_condition_id,
             task=args.task,
+            risk_semantics=args.risk_semantics,
+            use_condition_weight=args.use_condition_weight,
             horizon=args.horizon,
             num_workers=workers,
             seed=args.seed,
@@ -1091,24 +1802,50 @@ def main():
         split_dump_dir = args.split_dump_dir
         if not args.no_archive and split_dump_dir == 'experiments/outputs/splits':
             split_dump_dir = str(run_dir / "outputs" / "splits")
-        train_loader, val_loader, test_loader = get_dataloaders(
-            batch_size=batch_size,
-            split_ratio=split_ratio,
-            base_dir=args.base_dir,
-            split_mode=args.split_mode,
-            master_labels_path=args.master_labels_path,
-            label_source_policy=args.label_source_policy,
-            label_version=args.label_version,
-            test_condition_id=args.test_condition_id,
-            num_workers=workers,
-            seed=args.seed,
-        )
+        if args.task == "multi":
+            train_loader, val_loader, test_loader = get_cwru_multi_dataloaders(
+                batch_size=batch_size,
+                split_ratio=split_ratio,
+                base_dir=args.base_dir,
+                split_mode=args.split_mode,
+                test_condition_id=args.test_condition_id,
+                risk_semantics=args.risk_semantics,
+                num_workers=workers,
+                seed=args.seed,
+            )
+        else:
+            train_loader, val_loader, test_loader = get_dataloaders(
+                batch_size=batch_size,
+                split_ratio=split_ratio,
+                base_dir=args.base_dir,
+                split_mode=args.split_mode,
+                master_labels_path=args.master_labels_path,
+                label_source_policy=args.label_source_policy,
+                label_version=args.label_version,
+                risk_semantics=args.risk_semantics,
+                test_condition_id=args.test_condition_id,
+                num_workers=workers,
+                seed=args.seed,
+            )
         dump_split_files_for_cwru(
             train_loader=train_loader,
             val_loader=val_loader,
             test_loader=test_loader,
             split_dump_dir=split_dump_dir,
         )
+
+    if args.semantic_check_only:
+        report = semantic_check_report(
+            data_source=args.data_source,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+        )
+        sem_path = outputs_dir / "semantic_check.json"
+        sem_path.parent.mkdir(parents=True, exist_ok=True)
+        sem_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"语义检查完成: {sem_path}")
+        return
 
     # 模型初始化（DirectML 对部分 1D 算子支持有限，失败则回退 CPU）
     backbone = build_backbone(
@@ -1133,33 +1870,81 @@ def main():
         if args.data_source == 'sound_api_cache':
             eval_fn = evaluate_regression
         else:
-            eval_fn = lambda b, h, c, d, dev: (0.0, 0.0)  # 占位
+            eval_fn = lambda b, h, c, d, dev: (0.0, 0.0)  # placeholder
     elif args.task == 'risk':
         head = BinaryClassificationHead(in_features=embedding_dim, dropout=args.head_dropout).to(device)
-        criterion = nn.BCEWithLogitsLoss()
+        pos_weight_value = estimate_pos_weight_from_loader(train_loader)
+        pos_weight_tensor = torch.tensor([pos_weight_value], dtype=torch.float32, device=device)
+        criterion = nn.BCEWithLogitsLoss(reduction='none', pos_weight=pos_weight_tensor)
+        print(f"risk pos_weight(train-only): {pos_weight_value:.4f}")
         train_fn = train_one_epoch_binary
-        if args.data_source == 'sound_api_cache':
-            eval_fn = evaluate_binary
-        else:
-            eval_fn = lambda b, h, c, d, dev, threshold=0.5: (
-                0.0, 0.0, np.array([]), np.array([]), [], 0.0, 0.0
-            )
+        eval_fn = evaluate_binary
+    elif args.task == 'multi':
+        sample_ds = train_loader.dataset
+        condition_vocab = getattr(sample_ds, 'condition_vocab', None) or ['unknown']
+        n_condition_classes = int(len(condition_vocab))
+        head = MultiTaskHead(
+            in_features=embedding_dim,
+            n_fault_classes=4,
+            n_condition_classes=n_condition_classes,
+            dropout=args.head_dropout,
+        ).to(device)
+        pos_weight_value = estimate_pos_weight_from_loader(train_loader)
+        pos_weight_tensor = torch.tensor([pos_weight_value], dtype=torch.float32, device=device)
+        criterion = {
+            'risk': nn.BCEWithLogitsLoss(reduction='none', pos_weight=pos_weight_tensor),
+            'fault': nn.CrossEntropyLoss(),
+            'condition': nn.CrossEntropyLoss(),
+        }
+        print(
+            'multi loss weights: '
+            f"risk={args.loss_w_risk}, fault={args.loss_w_fault}, condition={args.loss_w_condition}"
+        )
+        print(f"multi risk pos_weight(train-only): {pos_weight_value:.4f}")
+        train_fn = train_one_epoch_multi
+        eval_fn = evaluate_multi
     else:  # arcface
-        # 推断 num_classes
         all_labels = []
         for _, y in train_loader:
             all_labels.append(y)
         num_classes = torch.cat(all_labels).unique().numel()
-        
+
         if num_classes < 2:
-            raise ValueError(f"ArcFace 任务需要至少 2 个类别，当前只有 {num_classes} 个")
-        
+            raise ValueError(f"ArcFace task needs >=2 classes, got {num_classes}")
+
         head = ArcMarginProduct(in_features=embedding_dim, out_features=num_classes, s=30.0, m=0.5).to(device)
         criterion = nn.CrossEntropyLoss()
         train_fn = train_one_epoch_arcface
         eval_fn = evaluate_arcface
 
-    param_groups = list(backbone.parameters()) + list(head.parameters())
+    if args.init_checkpoint_dir:
+        init_dir = Path(args.init_checkpoint_dir)
+        init_backbone_path = init_dir / 'backbone.pth'
+        init_head_path = init_dir / get_head_checkpoint_name(args.task)
+        if not init_backbone_path.exists():
+            raise FileNotFoundError(f"Init failed, missing: {init_backbone_path}")
+        backbone.load_state_dict(torch.load(init_backbone_path, map_location='cpu', weights_only=True))
+        if not args.init_backbone_only:
+            if not init_head_path.exists():
+                raise FileNotFoundError(f"Init failed, missing: {init_head_path}")
+            head.load_state_dict(torch.load(init_head_path, map_location='cpu', weights_only=True))
+        backbone.to(device)
+        head.to(device)
+        if args.init_backbone_only:
+            print(f"Loaded init backbone only: {init_backbone_path}")
+        else:
+            print(f"Loaded init checkpoint dir: {init_dir}")
+
+    if args.freeze_backbone:
+        for p in backbone.parameters():
+            p.requires_grad = False
+        print("已冻结 backbone，仅训练任务 head")
+
+    trainable_backbone_params = [p for p in backbone.parameters() if p.requires_grad]
+    trainable_head_params = [p for p in head.parameters() if p.requires_grad]
+    param_groups = trainable_backbone_params + trainable_head_params
+    if len(param_groups) == 0:
+        raise RuntimeError("无可训练参数，请检查 freeze 配置")
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(
             param_groups,
@@ -1183,8 +1968,9 @@ def main():
             optimizer, mode="min", factor=0.5, patience=3, min_lr=args.min_lr
         )
 
-    best_val_metric = float('inf') if args.task in ['hi', 'risk'] else 0.0
+    best_val_metric = float('inf') if args.task in ['hi', 'risk', 'multi'] else 0.0
     best_risk_threshold = float(args.risk_threshold)
+    best_risk_direction = forced_risk_direction or "normal"
     no_improve_epochs = 0
     os.makedirs(ckpt_out_dir, exist_ok=True)
     os.makedirs(plots_dir, exist_ok=True)
@@ -1193,7 +1979,7 @@ def main():
     if args.eval_only:
         ckpt_dir = Path(args.checkpoint_dir)
         backbone_path = ckpt_dir / "backbone.pth"
-        head_path = ckpt_dir / f"{args.task}_head.pth"
+        head_path = ckpt_dir / get_head_checkpoint_name(args.task)
         if not backbone_path.exists() or not head_path.exists():
             print(f"未找到 checkpoint: {backbone_path} 或 {head_path}")
             return
@@ -1210,7 +1996,74 @@ def main():
                     print(f"从归档读取风险阈值: {best_risk_threshold:.4f}")
                 except ValueError:
                     print(f"风险阈值文件解析失败，继续使用 --risk_threshold={best_risk_threshold:.4f}")
+            dir_path = ckpt_dir.parent / "outputs" / "risk_score_direction.txt"
+            if dir_path.exists():
+                d_text = dir_path.read_text(encoding="utf-8").strip().lower()
+                if d_text in ("normal", "inverted"):
+                    best_risk_direction = d_text
+                    print(f"从归档读取风险方向: {best_risk_direction}")
+            if forced_risk_direction in ("normal", "inverted"):
+                best_risk_direction = forced_risk_direction
+                print(f"使用固定风险方向: {best_risk_direction}")
+            if args.calibrate_threshold or args.calibrate_sign:
+                val_loss_tmp, _, val_preds_tmp, val_targets_tmp, _, _, _ = eval_fn(
+                    backbone, head, criterion, val_loader, device, threshold=best_risk_threshold
+                )
+                cal = calibrate_risk_with_config(
+                    targets=val_targets_tmp,
+                    probs=val_preds_tmp,
+                    default_threshold=best_risk_threshold,
+                )
+                best_risk_threshold = float(cal["threshold"])
+                best_risk_direction = str(cal["direction"])
+                print(
+                    f"验证集后处理校准: direction={best_risk_direction}, "
+                    f"threshold={best_risk_threshold:.4f}, score={cal.get('score', 0.0):.4f}"
+                )
         # 快速验证：仅用测试集前 N 个样本，fast_eval 时用大 batch 减少迭代
+        if args.task == "multi":
+            th_path = ckpt_dir.parent / "outputs" / "risk_threshold.txt"
+            if th_path.exists():
+                try:
+                    best_risk_threshold = float(th_path.read_text(encoding="utf-8").strip())
+                    print(f"Load archived risk threshold: {best_risk_threshold:.4f}")
+                except ValueError:
+                    print(f"Risk threshold parse failed, keep --risk_threshold={best_risk_threshold:.4f}")
+            dir_path = ckpt_dir.parent / "outputs" / "risk_score_direction.txt"
+            if dir_path.exists():
+                d_text = dir_path.read_text(encoding="utf-8").strip().lower()
+                if d_text in ("normal", "inverted"):
+                    best_risk_direction = d_text
+                    print(f"Load archived risk direction: {best_risk_direction}")
+            if forced_risk_direction in ("normal", "inverted"):
+                best_risk_direction = forced_risk_direction
+                print(f"Use forced risk direction: {best_risk_direction}")
+            if args.calibrate_threshold or args.calibrate_sign:
+                val_eval_tmp = eval_fn(
+                    backbone=backbone,
+                    head=head,
+                    loss_fns=criterion,
+                    loss_weights={
+                        "risk": float(args.loss_w_risk),
+                        "fault": float(args.loss_w_fault),
+                        "condition": float(args.loss_w_condition),
+                    },
+                    dataloader=val_loader,
+                    device=device,
+                    risk_threshold=best_risk_threshold,
+                )
+                cal = calibrate_risk_with_config(
+                    targets=val_eval_tmp["risk_targets"],
+                    probs=val_eval_tmp["risk_probs"],
+                    default_threshold=best_risk_threshold,
+                )
+                best_risk_threshold = float(cal["threshold"])
+                best_risk_direction = str(cal["direction"])
+                print(
+                    f"Val calibration (multi): direction={best_risk_direction}, "
+                    f"threshold={best_risk_threshold:.4f}, score={cal.get('score', 0.0):.4f}"
+                )
+
         if getattr(args, "max_test_samples", None) and args.max_test_samples > 0:
             from torch.utils.data import Subset
             n = min(args.max_test_samples, len(test_loader.dataset))
@@ -1236,22 +2089,117 @@ def main():
             if not (getattr(args, "max_test_samples", None) and args.max_test_samples > 0):
                 plot_hi_predictions(test_preds, test_targets, test_meta, str(plots_dir))
         elif args.task == 'risk':
-            print(f"使用风险阈值: {best_risk_threshold:.4f}")
+            print(f"使用风险阈值: {best_risk_threshold:.4f} | 方向: {best_risk_direction}")
             test_loss, test_acc, test_preds, test_targets, test_meta, test_auc, test_pr_auc = eval_fn(
                 backbone, head, criterion, test_loader, device, threshold=best_risk_threshold
             )
+            test_scores = apply_risk_direction(test_preds, best_risk_direction)
+            m = compute_binary_metrics(test_scores, test_targets, threshold=best_risk_threshold)
             print(
-                f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f} | "
-                f"Test AUC: {test_auc:.4f} | Test PR-AUC: {test_pr_auc:.4f}"
+                f"Test Loss: {test_loss:.4f} | Test Acc: {m.get('acc', 0.0):.4f} | "
+                f"Test AUC: {m.get('auc', 0.0):.4f} | Test PR-AUC: {m.get('pr_auc', 0.0):.4f}"
             )
             if not (getattr(args, "max_test_samples", None) and args.max_test_samples > 0):
-                plot_risk_predictions(test_preds, test_targets, test_meta, str(plots_dir))
+                plot_risk_predictions(test_scores, test_targets, test_meta, str(plots_dir))
                 save_risk_predictions_csv(
-                    risk_pred_path, test_preds, test_targets, test_meta, threshold=best_risk_threshold
+                    risk_pred_path, test_scores, test_targets, test_meta, threshold=best_risk_threshold
                 )
                 save_risk_condition_metrics_csv(
-                    risk_cond_metrics_path, test_preds, test_targets, test_meta, threshold=best_risk_threshold
+                    risk_cond_metrics_path, test_scores, test_targets, test_meta, threshold=best_risk_threshold
                 )
+                save_risk_condition_metrics_csv(
+                    per_condition_metrics_path, test_scores, test_targets, test_meta, threshold=best_risk_threshold
+                )
+                m["test_loss"] = test_loss
+                (outputs_dir / "risk_threshold.txt").write_text(
+                    f"{best_risk_threshold:.6f}\n", encoding="utf-8"
+                )
+                risk_score_direction_path.write_text(f"{best_risk_direction}\n", encoding="utf-8")
+                save_metrics_csv(metrics_path, m)
+                save_metrics_csv(overall_metrics_path, m)
+                save_risk_domain_metrics_csv(
+                    risk_domain_metrics_path,
+                    [{
+                        "domain_id": args.data_source,
+                        "n_samples": len(test_targets),
+                        "acc": m.get("acc", 0.0),
+                        "auc": m.get("auc", 0.0),
+                        "pr_auc": m.get("pr_auc", 0.0),
+                        "balanced_acc": m.get("balanced_acc", 0.0),
+                        "f1": m.get("f1", 0.0),
+                        "normal_recall": m.get("normal_recall", 0.0),
+                    }],
+                )
+                save_risk_domain_metrics_csv(
+                    per_domain_metrics_path,
+                    [{
+                        "domain_id": args.data_source,
+                        "n_samples": len(test_targets),
+                        "acc": m.get("acc", 0.0),
+                        "auc": m.get("auc", 0.0),
+                        "pr_auc": m.get("pr_auc", 0.0),
+                        "balanced_acc": m.get("balanced_acc", 0.0),
+                        "f1": m.get("f1", 0.0),
+                        "normal_recall": m.get("normal_recall", 0.0),
+                    }],
+                )
+        elif args.task == "multi":
+            print(f"Use risk threshold={best_risk_threshold:.4f} | direction={best_risk_direction}")
+            test_eval = eval_fn(
+                backbone=backbone,
+                head=head,
+                loss_fns=criterion,
+                loss_weights={
+                    "risk": float(args.loss_w_risk),
+                    "fault": float(args.loss_w_fault),
+                    "condition": float(args.loss_w_condition),
+                },
+                dataloader=test_loader,
+                device=device,
+                risk_threshold=best_risk_threshold,
+            )
+            test_scores = apply_risk_direction(test_eval["risk_probs"], best_risk_direction)
+            risk_m = compute_binary_metrics(
+                test_scores, test_eval["risk_targets"], threshold=best_risk_threshold
+            )
+            fault_m = compute_multiclass_metrics(test_eval["fault_logits"], test_eval["fault_targets"])
+            cond_m = compute_multiclass_metrics(
+                test_eval["condition_logits"], test_eval["condition_targets"]
+            )
+            summary = {
+                "test_loss": float(test_eval["loss"]),
+                "risk_auc": risk_m.get("auc", 0.0),
+                "risk_pr_auc": risk_m.get("pr_auc", 0.0),
+                "risk_balanced_acc": risk_m.get("balanced_acc", 0.0),
+                "risk_normal_recall": risk_m.get("normal_recall", 0.0),
+                "fault_acc": fault_m.get("acc", 0.0),
+                "fault_macro_f1": fault_m.get("macro_f1", 0.0),
+                "condition_acc": cond_m.get("acc", 0.0),
+                "condition_macro_f1": cond_m.get("macro_f1", 0.0),
+            }
+            print(
+                f"Test Loss: {summary['test_loss']:.4f} | "
+                f"Risk AUC: {summary['risk_auc']:.4f} | Fault F1: {summary['fault_macro_f1']:.4f} | "
+                f"Condition F1: {summary['condition_macro_f1']:.4f}"
+            )
+            save_metrics_csv(overall_metrics_path, summary)
+            save_metrics_csv(metrics_path, summary)
+            risk_only = dict(risk_m)
+            risk_only["test_loss"] = float(test_eval["loss_risk"])
+            save_metrics_csv(risk_metrics_path, risk_only)
+            save_multiclass_metrics_csv(fault_metrics_path, fault_m)
+            save_multiclass_metrics_csv(condition_metrics_path, cond_m)
+            save_risk_condition_metrics_csv(
+                per_condition_metrics_path,
+                test_scores,
+                test_eval["risk_targets"],
+                test_eval["meta"],
+                threshold=best_risk_threshold,
+            )
+            (outputs_dir / "risk_threshold.txt").write_text(
+                f"{best_risk_threshold:.6f}\n", encoding="utf-8"
+            )
+            risk_score_direction_path.write_text(f"{best_risk_direction}\n", encoding="utf-8")
         else:
             test_loss, test_acc = eval_fn(backbone, head, criterion, test_loader, device)
             print(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f}")
@@ -1273,11 +2221,31 @@ def main():
     for epoch in range(1, epochs + 1):
         print(f"\nEpoch [{epoch}/{epochs}]")
 
-        train_loss, train_metric = train_fn(
-            backbone, head, optimizer, criterion, train_loader, device,
-            use_amp=use_amp, scaler=scaler,
-        )
-        
+        if args.task == "multi":
+            loss_weights = {
+                "risk": float(args.loss_w_risk),
+                "fault": float(args.loss_w_fault),
+                "condition": float(args.loss_w_condition),
+            }
+            train_loss, train_metrics = train_fn(
+                backbone=backbone,
+                head=head,
+                optimizer=optimizer,
+                loss_fns=criterion,
+                loss_weights=loss_weights,
+                dataloader=train_loader,
+                device=device,
+                use_amp=use_amp,
+                scaler=scaler,
+            )
+        else:
+            train_loss, train_metric = train_fn(
+                backbone, head, optimizer, criterion, train_loader, device,
+                use_amp=use_amp, scaler=scaler,
+            )
+        candidate_risk_threshold = best_risk_threshold
+        candidate_risk_direction = best_risk_direction
+
         if args.task == 'hi':
             val_loss, val_metric, val_preds, val_targets, val_meta = eval_fn(
                 backbone, head, criterion, val_loader, device
@@ -1291,13 +2259,80 @@ def main():
             val_loss, val_acc, val_preds, val_targets, val_meta, val_auc, val_pr_auc = eval_fn(
                 backbone, head, criterion, val_loader, device, threshold=best_risk_threshold
             )
+            if args.calibrate_threshold or args.calibrate_sign:
+                cal = calibrate_risk_with_config(
+                    targets=val_targets,
+                    probs=val_preds,
+                    default_threshold=best_risk_threshold,
+                )
+                candidate_risk_threshold = float(cal["threshold"])
+                candidate_risk_direction = str(cal["direction"])
+            val_scores = apply_risk_direction(val_preds, candidate_risk_direction)
+            val_metrics = compute_binary_metrics(
+                val_scores, val_targets, threshold=candidate_risk_threshold
+            )
             print(
                 f"Train Loss: {train_loss:.4f} | Train Acc: {train_metric:.4f} | "
                 f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | "
-                f"Val AUC: {val_auc:.4f} | Val PR-AUC: {val_pr_auc:.4f}"
+                f"Val AUC(raw): {val_auc:.4f} | Val AUC(cal): {val_metrics.get('auc', 0.0):.4f} | "
+                f"Val PR-AUC(cal): {val_metrics.get('pr_auc', 0.0):.4f} | "
+                f"dir={candidate_risk_direction} th={candidate_risk_threshold:.4f}"
             )
-            val_metric = 1.0 - val_auc  # 用于 best model 选择（越小越好）
+            val_metric = 1.0 - float(val_metrics.get("auc", 0.0))  # ????
             metric_name = "AUC"
+        elif args.task == 'multi':
+            val_eval = eval_fn(
+                backbone=backbone,
+                head=head,
+                loss_fns=criterion,
+                loss_weights={
+                    "risk": float(args.loss_w_risk),
+                    "fault": float(args.loss_w_fault),
+                    "condition": float(args.loss_w_condition),
+                },
+                dataloader=val_loader,
+                device=device,
+                risk_threshold=best_risk_threshold,
+            )
+            val_preds = val_eval["risk_probs"]
+            val_targets = val_eval["risk_targets"]
+            if args.calibrate_threshold or args.calibrate_sign:
+                cal = calibrate_risk_with_config(
+                    targets=val_targets,
+                    probs=val_preds,
+                    default_threshold=best_risk_threshold,
+                )
+                candidate_risk_threshold = float(cal["threshold"])
+                candidate_risk_direction = str(cal["direction"])
+            val_scores = apply_risk_direction(val_preds, candidate_risk_direction)
+            risk_val_metrics = compute_binary_metrics(
+                val_scores, val_targets, threshold=candidate_risk_threshold
+            )
+            fault_val_metrics = compute_multiclass_metrics(
+                val_eval["fault_logits"], val_eval["fault_targets"]
+            )
+            cond_val_metrics = compute_multiclass_metrics(
+                val_eval["condition_logits"], val_eval["condition_targets"]
+            )
+            print(
+                f"Train Loss: {train_loss:.4f} | "
+                f"Risk/Fault/Cond Train Acc: {train_metrics.get('risk_acc', 0.0):.4f}/"
+                f"{train_metrics.get('fault_acc', 0.0):.4f}/"
+                f"{train_metrics.get('condition_acc', 0.0):.4f} | "
+                f"Val Loss: {val_eval['loss']:.4f} | "
+                f"Val Risk AUC: {risk_val_metrics.get('auc', 0.0):.4f} | "
+                f"Val Fault F1: {fault_val_metrics.get('macro_f1', 0.0):.4f} | "
+                f"Val Cond F1: {cond_val_metrics.get('macro_f1', 0.0):.4f} | "
+                f"dir={candidate_risk_direction} th={candidate_risk_threshold:.4f}"
+            )
+            score = (
+                float(risk_val_metrics.get("auc", 0.0))
+                + float(fault_val_metrics.get("macro_f1", 0.0))
+                + float(cond_val_metrics.get("macro_f1", 0.0))
+            ) / 3.0
+            val_metric = 1.0 - score
+            val_loss = float(val_eval["loss"])
+            metric_name = "Composite"
         else:  # arcface
             val_loss, val_metric = eval_fn(
                 backbone, head, criterion, val_loader, device
@@ -1311,7 +2346,7 @@ def main():
         # 保存最优模型
         is_best = False
         improved = False
-        if args.task in ['hi', 'risk']:
+        if args.task in ['hi', 'risk', 'multi']:
             if val_metric < (best_val_metric - args.early_stop_min_delta):
                 best_val_metric = val_metric
                 is_best = True
@@ -1323,26 +2358,26 @@ def main():
                 improved = True
         
         if is_best:
-            if args.task == "risk" and args.calibrate_threshold and val_preds.size > 0:
-                best_risk_threshold = calibrate_binary_threshold(
-                    targets=val_targets,
-                    probs=val_preds,
-                    default_threshold=float(args.risk_threshold),
+            if args.task in ("risk", "multi"):
+                best_risk_threshold = float(candidate_risk_threshold)
+                best_risk_direction = str(candidate_risk_direction)
+                print(
+                    f"  -> Calibrated risk postprocess: "
+                    f"direction={best_risk_direction}, threshold={best_risk_threshold:.4f}"
                 )
-                print(f"  -> Calibrated risk threshold: {best_risk_threshold:.4f}")
             torch.save(backbone.state_dict(), ckpt_out_dir / "backbone.pth")
-            if args.task == 'arcface':
-                torch.save(head.state_dict(), ckpt_out_dir / "arcface_head.pth")
-            else:
-                torch.save(head.state_dict(), ckpt_out_dir / f"{args.task}_head.pth")
-            if args.task == "risk":
+            torch.save(head.state_dict(), ckpt_out_dir / get_head_checkpoint_name(args.task))
+            if args.task in ("risk", "multi"):
                 best_display_metric = 1.0 - best_val_metric
             else:
                 best_display_metric = best_val_metric
             print(f"  -> New best model saved (Val {metric_name}: {best_display_metric:.4f})")
-            if args.task == "risk":
+            if args.task in ("risk", "multi"):
                 (outputs_dir / "risk_threshold.txt").write_text(
                     f"{best_risk_threshold:.6f}\n", encoding="utf-8"
+                )
+                risk_score_direction_path.write_text(
+                    f"{best_risk_direction}\n", encoding="utf-8"
                 )
 
         # 学习率调度（plateau 用验证损失，其余按 epoch）
@@ -1367,7 +2402,7 @@ def main():
 
     # 统一用最佳 checkpoint 做最终测试，避免最后一轮回退
     best_backbone = ckpt_out_dir / "backbone.pth"
-    best_head = ckpt_out_dir / ("arcface_head.pth" if args.task == "arcface" else f"{args.task}_head.pth")
+    best_head = ckpt_out_dir / get_head_checkpoint_name(args.task)
     if best_backbone.exists() and best_head.exists():
         backbone.load_state_dict(torch.load(best_backbone, map_location="cpu", weights_only=True))
         head.load_state_dict(torch.load(best_head, map_location="cpu", weights_only=True))
@@ -1391,48 +2426,168 @@ def main():
         plot_hi_predictions(test_preds, test_targets, test_meta, str(plots_dir))
         
         # 保存指标
-        save_metrics_csv(metrics_path, {
+        _metrics = {
             "test_loss": test_loss,
             "test_mae": test_mae,
             "test_rmse": test_rmse,
-        })
+        }
+        save_metrics_csv(metrics_path, _metrics)
+        save_metrics_csv(overall_metrics_path, _metrics)
     
     elif args.task == 'risk':
-        print(f"最终风险阈值: {best_risk_threshold:.4f}")
+        print(f"最终风险阈值: {best_risk_threshold:.4f} | 方向: {best_risk_direction}")
         test_loss, test_acc, test_preds, test_targets, test_meta, test_auc, test_pr_auc = eval_fn(
             backbone, head, criterion, test_loader, device, threshold=best_risk_threshold
         )
+        test_scores = apply_risk_direction(test_preds, best_risk_direction)
+        risk_metrics = compute_binary_metrics(test_scores, test_targets, threshold=best_risk_threshold)
         print(
-            f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f} | "
-            f"Test AUC: {test_auc:.4f} | Test PR-AUC: {test_pr_auc:.4f}"
+            f"Test Loss: {test_loss:.4f} | Test Acc: {risk_metrics.get('acc', 0.0):.4f} | "
+            f"Test AUC: {risk_metrics.get('auc', 0.0):.4f} | Test PR-AUC: {risk_metrics.get('pr_auc', 0.0):.4f}"
         )
         
         # 绘图
-        plot_risk_predictions(test_preds, test_targets, test_meta, str(plots_dir))
+        plot_risk_predictions(test_scores, test_targets, test_meta, str(plots_dir))
         save_risk_predictions_csv(
-            risk_pred_path, test_preds, test_targets, test_meta, threshold=best_risk_threshold
+            risk_pred_path, test_scores, test_targets, test_meta, threshold=best_risk_threshold
         )
         save_risk_condition_metrics_csv(
-            risk_cond_metrics_path, test_preds, test_targets, test_meta, threshold=best_risk_threshold
+            risk_cond_metrics_path, test_scores, test_targets, test_meta, threshold=best_risk_threshold
         )
-        
+        save_risk_condition_metrics_csv(
+            per_condition_metrics_path, test_scores, test_targets, test_meta, threshold=best_risk_threshold
+        )
+        risk_metrics["test_loss"] = test_loss
+        risk_score_direction_path.write_text(f"{best_risk_direction}\n", encoding="utf-8")
         # 保存指标
-        save_metrics_csv(metrics_path, {
-            "test_loss": test_loss,
-            "test_acc": test_acc,
-            "test_auc": test_auc,
-            "test_pr_auc": test_pr_auc,
-        })
+        save_metrics_csv(metrics_path, risk_metrics)
+        save_metrics_csv(overall_metrics_path, risk_metrics)
+
+        domain_rows = [{
+            "domain_id": args.data_source,
+            "n_samples": len(test_targets),
+            "acc": risk_metrics.get("acc", 0.0),
+            "auc": risk_metrics.get("auc", 0.0),
+            "pr_auc": risk_metrics.get("pr_auc", 0.0),
+            "balanced_acc": risk_metrics.get("balanced_acc", 0.0),
+            "f1": risk_metrics.get("f1", 0.0),
+            "normal_recall": risk_metrics.get("normal_recall", 0.0),
+        }]
+
+        if args.eval_protocol == "leave_one_domain_out" and args.test_domain == "cwru" and args.data_source != "cwru":
+            try:
+                cwru_train_loader, cwru_val_loader, cwru_test_loader = get_dataloaders(
+                    batch_size=batch_size,
+                    split_ratio=split_ratio,
+                    base_dir=args.base_dir,
+                    split_mode="random",
+                    master_labels_path=args.master_labels_path,
+                    label_source_policy=args.label_source_policy,
+                    label_version=args.label_version,
+                    risk_semantics=args.risk_semantics,
+                    num_workers=workers,
+                    seed=args.seed,
+                )
+                cwru_loss, cwru_acc, cwru_preds, cwru_targets, _, _, _ = evaluate_binary(
+                    backbone, head, criterion, cwru_test_loader, device, threshold=best_risk_threshold
+                )
+                cwru_scores = apply_risk_direction(cwru_preds, best_risk_direction)
+                cwru_metrics = compute_binary_metrics(cwru_scores, cwru_targets, threshold=best_risk_threshold)
+                cwru_metrics["test_loss"] = cwru_loss
+                domain_rows.append({
+                    "domain_id": "cwru",
+                    "n_samples": len(cwru_targets),
+                    "acc": cwru_metrics.get("acc", 0.0),
+                    "auc": cwru_metrics.get("auc", 0.0),
+                    "pr_auc": cwru_metrics.get("pr_auc", 0.0),
+                    "balanced_acc": cwru_metrics.get("balanced_acc", 0.0),
+                    "f1": cwru_metrics.get("f1", 0.0),
+                    "normal_recall": cwru_metrics.get("normal_recall", 0.0),
+                })
+                print(
+                    f"[Leave-One-Domain] CWRU Test | Loss: {cwru_loss:.4f} | "
+                    f"AUC: {cwru_metrics.get('auc', 0.0):.4f} | "
+                    f"BalancedAcc: {cwru_metrics.get('balanced_acc', 0.0):.4f} | "
+                    f"NormalRecall: {cwru_metrics.get('normal_recall', 0.0):.4f}"
+                )
+            except Exception as e:
+                print(f"跨域评估(CWRU)跳过: {e}")
+
+        save_risk_domain_metrics_csv(risk_domain_metrics_path, domain_rows)
+        save_risk_domain_metrics_csv(per_domain_metrics_path, domain_rows)
     
+    elif args.task == "multi":
+        print(f"Final risk threshold: {best_risk_threshold:.4f} | direction: {best_risk_direction}")
+        test_eval = eval_fn(
+            backbone=backbone,
+            head=head,
+            loss_fns=criterion,
+            loss_weights={
+                "risk": float(args.loss_w_risk),
+                "fault": float(args.loss_w_fault),
+                "condition": float(args.loss_w_condition),
+            },
+            dataloader=test_loader,
+            device=device,
+            risk_threshold=best_risk_threshold,
+        )
+        test_scores = apply_risk_direction(test_eval["risk_probs"], best_risk_direction)
+        risk_metrics = compute_binary_metrics(
+            test_scores, test_eval["risk_targets"], threshold=best_risk_threshold
+        )
+        fault_metrics = compute_multiclass_metrics(
+            test_eval["fault_logits"], test_eval["fault_targets"]
+        )
+        condition_metrics = compute_multiclass_metrics(
+            test_eval["condition_logits"], test_eval["condition_targets"]
+        )
+        summary_metrics = {
+            "test_loss": float(test_eval["loss"]),
+            "risk_auc": risk_metrics.get("auc", 0.0),
+            "risk_pr_auc": risk_metrics.get("pr_auc", 0.0),
+            "risk_balanced_acc": risk_metrics.get("balanced_acc", 0.0),
+            "risk_normal_recall": risk_metrics.get("normal_recall", 0.0),
+            "fault_acc": fault_metrics.get("acc", 0.0),
+            "fault_macro_f1": fault_metrics.get("macro_f1", 0.0),
+            "condition_acc": condition_metrics.get("acc", 0.0),
+            "condition_macro_f1": condition_metrics.get("macro_f1", 0.0),
+        }
+        print(
+            f"Test Loss: {summary_metrics['test_loss']:.4f} | "
+            f"Risk AUC: {summary_metrics['risk_auc']:.4f} | "
+            f"Fault F1: {summary_metrics['fault_macro_f1']:.4f} | "
+            f"Condition F1: {summary_metrics['condition_macro_f1']:.4f}"
+        )
+        save_metrics_csv(metrics_path, summary_metrics)
+        save_metrics_csv(overall_metrics_path, summary_metrics)
+        risk_only_metrics = dict(risk_metrics)
+        risk_only_metrics["test_loss"] = float(test_eval["loss_risk"])
+        save_metrics_csv(risk_metrics_path, risk_only_metrics)
+        save_multiclass_metrics_csv(fault_metrics_path, fault_metrics)
+        save_multiclass_metrics_csv(condition_metrics_path, condition_metrics)
+        save_risk_condition_metrics_csv(
+            per_condition_metrics_path,
+            test_scores,
+            test_eval["risk_targets"],
+            test_eval["meta"],
+            threshold=best_risk_threshold,
+        )
+        (outputs_dir / "risk_threshold.txt").write_text(
+            f"{best_risk_threshold:.6f}\n", encoding="utf-8"
+        )
+        risk_score_direction_path.write_text(f"{best_risk_direction}\n", encoding="utf-8")
+
     else:  # arcface
         test_loss, test_acc = eval_fn(
             backbone, head, criterion, test_loader, device
         )
         print(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f}")
-        save_metrics_csv(metrics_path, {
+        _metrics = {
             "test_loss": test_loss,
             "test_acc": test_acc,
-        })
+        }
+        save_metrics_csv(metrics_path, _metrics)
+        save_metrics_csv(overall_metrics_path, _metrics)
         # 输出类别 id 与可读名对应
         n_cls = getattr(head, "out_features", None)
         if n_cls is not None:
@@ -1443,13 +2598,24 @@ def main():
     if not args.no_archive:
         required_paths = [
             ckpt_out_dir / "backbone.pth",
-            ckpt_out_dir / ("arcface_head.pth" if args.task == "arcface" else f"{args.task}_head.pth"),
+            ckpt_out_dir / get_head_checkpoint_name(args.task),
             outputs_dir / "metrics.csv",
+            outputs_dir / "overall_metrics.csv",
             outputs_dir / "splits",
             plots_dir,
         ]
         if args.task == "risk":
             required_paths.append(outputs_dir / "risk_condition_metrics.csv")
+            required_paths.append(outputs_dir / "risk_domain_metrics.csv")
+            required_paths.append(outputs_dir / "per_condition_metrics.csv")
+            required_paths.append(outputs_dir / "per_domain_metrics.csv")
+            required_paths.append(outputs_dir / "risk_score_direction.txt")
+        if args.task == "multi":
+            required_paths.append(outputs_dir / "risk_metrics.csv")
+            required_paths.append(outputs_dir / "fault_metrics.csv")
+            required_paths.append(outputs_dir / "condition_metrics.csv")
+            required_paths.append(outputs_dir / "per_condition_metrics.csv")
+            required_paths.append(outputs_dir / "risk_score_direction.txt")
         missing = [str(p) for p in required_paths if not p.exists()]
         if missing:
             print("警告: 归档存在缺失项:")
