@@ -744,6 +744,38 @@ def save_multiclass_metrics_csv(
     save_metrics_csv(csv_path, rows)
 
 
+def resolve_multi_condition_eval_mode(args: argparse.Namespace) -> str:
+    if (
+        args.task == "multi"
+        and args.data_source == "cwru"
+        and args.split_mode == "leave_one_condition_out"
+    ):
+        return "open_set_auxiliary"
+    return "closed_set"
+
+
+def build_multi_summary_metrics(
+    test_loss: float,
+    risk_metrics: Dict[str, Any],
+    fault_metrics: Dict[str, Any],
+    condition_metrics: Dict[str, Any],
+    condition_eval_mode: str,
+) -> Dict[str, Any]:
+    return {
+        "test_loss": float(test_loss),
+        "risk_auc": risk_metrics.get("auc", 0.0),
+        "risk_pr_auc": risk_metrics.get("pr_auc", 0.0),
+        "risk_balanced_acc": risk_metrics.get("balanced_acc", 0.0),
+        "risk_normal_recall": risk_metrics.get("normal_recall", 0.0),
+        "fault_acc": fault_metrics.get("acc", 0.0),
+        "fault_macro_f1": fault_metrics.get("macro_f1", 0.0),
+        "condition_acc": condition_metrics.get("acc", 0.0),
+        "condition_macro_f1": condition_metrics.get("macro_f1", 0.0),
+        "condition_eval_mode": condition_eval_mode,
+        "condition_eval_supported": 1.0 if condition_eval_mode == "closed_set" else 0.0,
+    }
+
+
 def apply_risk_direction(probs: np.ndarray, direction: str) -> np.ndarray:
     """方向校准：normal=原分数，inverted=1-p。"""
     p = np.asarray(probs).reshape(-1).astype(np.float64)
@@ -1666,6 +1698,9 @@ def main():
     print(f"随机种子: {args.seed}, deterministic={args.deterministic}")
     if args.task == "multi" and args.data_source != "cwru":
         raise ValueError("task=multi 当前仅支持 CWRU，请使用 --data_source cwru")
+    multi_condition_eval_mode = resolve_multi_condition_eval_mode(args)
+    if args.task == "multi" and multi_condition_eval_mode == "open_set_auxiliary":
+        print("LOCO 下 condition 头仅作为辅助任务；主选模与主结论只看 risk/fault。")
     if args.data_source == "sound_api_cache":
         print("运行模式: XJTU 优先主线（sound_api_cache）")
     elif args.data_source == "cwru":
@@ -2166,21 +2201,22 @@ def main():
             cond_m = compute_multiclass_metrics(
                 test_eval["condition_logits"], test_eval["condition_targets"]
             )
-            summary = {
-                "test_loss": float(test_eval["loss"]),
-                "risk_auc": risk_m.get("auc", 0.0),
-                "risk_pr_auc": risk_m.get("pr_auc", 0.0),
-                "risk_balanced_acc": risk_m.get("balanced_acc", 0.0),
-                "risk_normal_recall": risk_m.get("normal_recall", 0.0),
-                "fault_acc": fault_m.get("acc", 0.0),
-                "fault_macro_f1": fault_m.get("macro_f1", 0.0),
-                "condition_acc": cond_m.get("acc", 0.0),
-                "condition_macro_f1": cond_m.get("macro_f1", 0.0),
-            }
+            summary = build_multi_summary_metrics(
+                test_loss=float(test_eval["loss"]),
+                risk_metrics=risk_m,
+                fault_metrics=fault_m,
+                condition_metrics=cond_m,
+                condition_eval_mode=multi_condition_eval_mode,
+            )
+            cond_label = (
+                "Condition F1"
+                if multi_condition_eval_mode == "closed_set"
+                else "Condition F1(aux/open-set)"
+            )
             print(
                 f"Test Loss: {summary['test_loss']:.4f} | "
                 f"Risk AUC: {summary['risk_auc']:.4f} | Fault F1: {summary['fault_macro_f1']:.4f} | "
-                f"Condition F1: {summary['condition_macro_f1']:.4f}"
+                f"{cond_label}: {summary['condition_macro_f1']:.4f}"
             )
             save_metrics_csv(overall_metrics_path, summary)
             save_metrics_csv(metrics_path, summary)
@@ -2314,6 +2350,11 @@ def main():
             cond_val_metrics = compute_multiclass_metrics(
                 val_eval["condition_logits"], val_eval["condition_targets"]
             )
+            cond_label = (
+                "Val Cond F1"
+                if multi_condition_eval_mode == "closed_set"
+                else "Val Cond F1(aux/open-set)"
+            )
             print(
                 f"Train Loss: {train_loss:.4f} | "
                 f"Risk/Fault/Cond Train Acc: {train_metrics.get('risk_acc', 0.0):.4f}/"
@@ -2322,17 +2363,23 @@ def main():
                 f"Val Loss: {val_eval['loss']:.4f} | "
                 f"Val Risk AUC: {risk_val_metrics.get('auc', 0.0):.4f} | "
                 f"Val Fault F1: {fault_val_metrics.get('macro_f1', 0.0):.4f} | "
-                f"Val Cond F1: {cond_val_metrics.get('macro_f1', 0.0):.4f} | "
+                f"{cond_label}: {cond_val_metrics.get('macro_f1', 0.0):.4f} | "
                 f"dir={candidate_risk_direction} th={candidate_risk_threshold:.4f}"
             )
-            score = (
-                float(risk_val_metrics.get("auc", 0.0))
-                + float(fault_val_metrics.get("macro_f1", 0.0))
-                + float(cond_val_metrics.get("macro_f1", 0.0))
-            ) / 3.0
+            score_terms = [
+                float(risk_val_metrics.get("auc", 0.0)),
+                float(fault_val_metrics.get("macro_f1", 0.0)),
+            ]
+            if multi_condition_eval_mode == "closed_set":
+                score_terms.append(float(cond_val_metrics.get("macro_f1", 0.0)))
+            score = sum(score_terms) / max(1, len(score_terms))
             val_metric = 1.0 - score
             val_loss = float(val_eval["loss"])
-            metric_name = "Composite"
+            metric_name = (
+                "Composite"
+                if multi_condition_eval_mode == "closed_set"
+                else "RiskFaultComposite"
+            )
         else:  # arcface
             val_loss, val_metric = eval_fn(
                 backbone, head, criterion, val_loader, device
@@ -2541,22 +2588,23 @@ def main():
         condition_metrics = compute_multiclass_metrics(
             test_eval["condition_logits"], test_eval["condition_targets"]
         )
-        summary_metrics = {
-            "test_loss": float(test_eval["loss"]),
-            "risk_auc": risk_metrics.get("auc", 0.0),
-            "risk_pr_auc": risk_metrics.get("pr_auc", 0.0),
-            "risk_balanced_acc": risk_metrics.get("balanced_acc", 0.0),
-            "risk_normal_recall": risk_metrics.get("normal_recall", 0.0),
-            "fault_acc": fault_metrics.get("acc", 0.0),
-            "fault_macro_f1": fault_metrics.get("macro_f1", 0.0),
-            "condition_acc": condition_metrics.get("acc", 0.0),
-            "condition_macro_f1": condition_metrics.get("macro_f1", 0.0),
-        }
+        summary_metrics = build_multi_summary_metrics(
+            test_loss=float(test_eval["loss"]),
+            risk_metrics=risk_metrics,
+            fault_metrics=fault_metrics,
+            condition_metrics=condition_metrics,
+            condition_eval_mode=multi_condition_eval_mode,
+        )
+        cond_label = (
+            "Condition F1"
+            if multi_condition_eval_mode == "closed_set"
+            else "Condition F1(aux/open-set)"
+        )
         print(
             f"Test Loss: {summary_metrics['test_loss']:.4f} | "
             f"Risk AUC: {summary_metrics['risk_auc']:.4f} | "
             f"Fault F1: {summary_metrics['fault_macro_f1']:.4f} | "
-            f"Condition F1: {summary_metrics['condition_macro_f1']:.4f}"
+            f"{cond_label}: {summary_metrics['condition_macro_f1']:.4f}"
         )
         save_metrics_csv(metrics_path, summary_metrics)
         save_metrics_csv(overall_metrics_path, summary_metrics)
